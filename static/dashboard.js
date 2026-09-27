@@ -97,8 +97,9 @@
     var opts = options || {};
     var headers = { Accept: "application/json" };
     if (state.key) headers.Authorization = "Bearer " + state.key;
+    if (opts.body) headers["Content-Type"] = "application/json";
 
-    return fetch(API_BASE + path, { method: opts.method || "GET", headers: headers }).then(
+    return fetch(API_BASE + path, { method: opts.method || "GET", headers: headers, body: opts.body || undefined }).then(
       function (res) {
         if (res.status === 401) {
           signOut("That API key was rejected. Please sign in again.");
@@ -401,6 +402,132 @@
       });
   }
 
+  // ── New-payment dialog (#758 / #759) ─────────────────────────────────
+
+  /** Validate amount: positive, ≤7 decimals, no exponent notation. */
+  function validateAmount(val) {
+    if (!val) return "Amount is required.";
+    if (/[eE]/.test(val)) return "Exponent notation is not allowed.";
+    if (!/^\d+(\.\d+)?$/.test(val)) return "Enter a positive number.";
+    var parts = val.split(".");
+    if (parts[1] && parts[1].length > 7) return "At most 7 decimal places allowed.";
+    if (parseFloat(val) <= 0) return "Amount must be greater than zero.";
+    return null;
+  }
+
+  /** Validate webhook_url: must be absent or an absolute https:// URL. */
+  function validateWebhook(val) {
+    if (!val) return null; // optional
+    if (!/^https:\/\/.+/i.test(val)) return "Webhook URL must start with https://.";
+    try {
+      var u = new URL(val);
+      if (u.protocol !== "https:") return "Webhook URL must use https://.";
+    } catch (e) {
+      return "Enter a valid absolute URL.";
+    }
+    return null;
+  }
+
+  function setFieldError(inputEl, errEl, message) {
+    if (message) {
+      inputEl.setAttribute("aria-invalid", "true");
+      errEl.textContent = message;
+      show(errEl, true);
+    } else {
+      inputEl.removeAttribute("aria-invalid");
+      errEl.textContent = "";
+      show(errEl, false);
+    }
+  }
+
+  function resetDialog() {
+    $("payment-form").reset();
+    setFieldError($("p-amount"), $("p-amount-err"), null);
+    setFieldError($("p-asset"), $("p-asset-err"), null);
+    setFieldError($("p-webhook"), $("p-webhook-err"), null);
+    setError($("p-form-err"), null);
+    $("dialog-submit").disabled = false;
+    $("dialog-submit").textContent = "Create";
+  }
+
+  function openPaymentDialog() {
+    resetDialog();
+    $("payment-dialog").showModal();
+    $("p-amount").focus();
+  }
+
+  function closePaymentDialog() {
+    $("payment-dialog").close();
+  }
+
+  /** Map a 400 API error code to the right field error element pair. */
+  var FIELD_ERROR_MAP = {
+    invalid_amount:       { input: "p-amount",  err: "p-amount-err"  },
+    amount_out_of_range:  { input: "p-amount",  err: "p-amount-err"  },
+    invalid_asset:        { input: "p-asset",   err: "p-asset-err"   },
+    invalid_webhook_url:  { input: "p-webhook", err: "p-webhook-err" },
+  };
+
+  function submitPayment(ev) {
+    ev.preventDefault();
+
+    var amountVal  = $("p-amount").value.trim();
+    var assetVal   = $("p-asset").value.trim();
+    var webhookVal = $("p-webhook").value.trim();
+
+    // Client-side validation (#759)
+    var amountErr  = validateAmount(amountVal);
+    var assetErr   = assetVal ? null : "Asset is required.";
+    var webhookErr = validateWebhook(webhookVal);
+
+    setFieldError($("p-amount"),  $("p-amount-err"),  amountErr);
+    setFieldError($("p-asset"),   $("p-asset-err"),   assetErr);
+    setFieldError($("p-webhook"), $("p-webhook-err"), webhookErr);
+
+    if (amountErr || assetErr || webhookErr) {
+      // Focus the first invalid field
+      if (amountErr)       { $("p-amount").focus(); }
+      else if (assetErr)   { $("p-asset").focus(); }
+      else                 { $("p-webhook").focus(); }
+      return;
+    }
+
+    $("dialog-submit").disabled = true;
+    $("dialog-submit").textContent = "Creating…";
+    setError($("p-form-err"), null);
+
+    var body = { amount: amountVal, asset: assetVal };
+    if (webhookVal) body.webhook_url = webhookVal;
+
+    // Use the versioned api() helper so all requests stay under API_BASE (#758)
+    api("/payments", { method: "POST", body: JSON.stringify(body) })
+      .then(function (payment) {
+        closePaymentDialog();
+        // Insert the new payment at the top of the list (#758)
+        var firstRow = $("rows").firstChild;
+        appendRow(payment);
+        var appended = $("rows").lastChild;
+        $("rows").insertBefore(appended, firstRow || null);
+        show($("empty"), false);
+      })
+      .catch(function (err) {
+        if (err.message !== "unauthorized") {
+          // Try to map structured error codes onto fields (#759)
+          // api() rejects with the body.error string; re-check the response
+          // by parsing it from the message when it matches a known code.
+          var mapped = FIELD_ERROR_MAP[err.message];
+          if (mapped) {
+            setFieldError($(mapped.input), $(mapped.err), err.message);
+            $(mapped.input).focus();
+          } else {
+            setError($("p-form-err"), err.message);
+          }
+        }
+        $("dialog-submit").disabled = false;
+        $("dialog-submit").textContent = "Create";
+      });
+  }
+
   // ── Wiring ────────────────────────────────────────────────────────────
 
   function init() {
@@ -422,6 +549,16 @@
     $("load-more").addEventListener("click", loadPayments);
     $("detail-close").addEventListener("click", closeDetail);
     $("scrim").addEventListener("click", closeDetail);
+
+    // New-payment dialog (#758 / #759)
+    $("new-payment").addEventListener("click", openPaymentDialog);
+    $("dialog-close").addEventListener("click", closePaymentDialog);
+    $("dialog-cancel").addEventListener("click", closePaymentDialog);
+    $("payment-form").addEventListener("submit", submitPayment);
+    $("payment-dialog").addEventListener("click", function (ev) {
+      // Close on backdrop click (click on the <dialog> element itself)
+      if (ev.target === $("payment-dialog")) closePaymentDialog();
+    });
 
     document.addEventListener("keydown", function (ev) {
       if (ev.key === "Escape") closeDetail();

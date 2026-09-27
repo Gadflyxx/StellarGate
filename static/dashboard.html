@@ -72,7 +72,60 @@
             <button class="chip" data-status="expired">Expired</button>
           </div>
           <button id="refresh" class="ghost">Refresh</button>
+          <button id="new-payment" class="primary">+ New payment</button>
         </section>
+
+        <!-- New-payment dialog (#758 / #759) -->
+        <dialog id="payment-dialog" aria-labelledby="dialog-title">
+          <form id="payment-form" method="dialog" novalidate autocomplete="off">
+            <div class="dialog-head">
+              <h2 id="dialog-title">New payment</h2>
+              <button type="button" id="dialog-close" class="ghost" aria-label="Close">&times;</button>
+            </div>
+
+            <label for="p-amount">Amount <span aria-hidden="true">*</span></label>
+            <input
+              id="p-amount"
+              name="amount"
+              type="text"
+              inputmode="decimal"
+              placeholder="e.g. 10.5"
+              required
+              aria-required="true"
+              aria-describedby="p-amount-err"
+            />
+            <p id="p-amount-err" class="field-error" hidden></p>
+
+            <label for="p-asset">Asset <span aria-hidden="true">*</span></label>
+            <input
+              id="p-asset"
+              name="asset"
+              type="text"
+              placeholder="XLM or USDC"
+              required
+              aria-required="true"
+              aria-describedby="p-asset-err"
+            />
+            <p id="p-asset-err" class="field-error" hidden></p>
+
+            <label for="p-webhook">Webhook URL <span class="muted small">(optional)</span></label>
+            <input
+              id="p-webhook"
+              name="webhook_url"
+              type="url"
+              placeholder="https://example.com/webhook"
+              aria-describedby="p-webhook-err"
+            />
+            <p id="p-webhook-err" class="field-error" hidden></p>
+
+            <p id="p-form-err" class="error" hidden></p>
+
+            <div class="dialog-foot">
+              <button type="button" id="dialog-cancel" class="ghost">Cancel</button>
+              <button type="submit" id="dialog-submit" class="primary">Create</button>
+            </div>
+          </form>
+        </dialog>
 
         <section class="card">
           <table class="payments">
