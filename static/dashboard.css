@@ -239,6 +239,23 @@ h3 {
   word-break: break-all;
 }
 
+/* Visually hidden, still announced. Used by the `aria-live` region: the text is
+   for a screen reader only, and a sighted operator gets the same information
+   from the visible row highlight (#721). `position: absolute` rather than
+   `display: none`, which would remove it from the accessibility tree entirely
+   and silence the announcement it exists to make. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .card {
   background: var(--surface);
   border: 1px solid var(--border);
@@ -442,6 +459,35 @@ main {
 }
 .search input {
   min-width: 220px;
+}
+.search button {
+  padding: 0.3rem 0.55rem;
+  line-height: 1;
+  font-size: 1rem;
+}
+
+/* Focus is the primary affordance for a keyboard-first list, so it gets a ring
+   that survives both colour schemes rather than the browser default that
+   disappears against the dark surface. */
+.search input:focus-visible,
+.payments tbody tr:focus-visible,
+.row-active {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+kbd {
+  display: inline-block;
+  min-width: 1.4em;
+  padding: 0.1rem 0.35rem;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8em;
+  text-align: center;
 }
 .search button {
   padding: 0.3rem 0.55rem;

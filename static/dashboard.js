@@ -203,7 +203,7 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
       var hash = parts.length ? "#" + parts.join("&") : "";
       window.history.replaceState(null, "", window.location.pathname + window.location.search + hash);
     } catch (e) {
-      /* non-fatal */
+      return null;
     }
   }
 
@@ -328,12 +328,185 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     });
   }
 
-  // ── Skeleton helpers (#719) ───────────────────────────────────────────
+  /* ── Payments list ───────────────────────────────────────────────────── */
+
+  /* Set while a request is in flight, so a refresh arriving mid-flight is
+     deferred rather than dropped. Letting two requests run concurrently would
+     let both responses append and double the list. */
+  var reloadPending = false;
+
+  function reload() {
+    store.resetPaging();
+    store.update({ loadedPayments: [] });
+    clear($("rows"));
+    clearListState();
+    loadPayments();
+  }
+
+  function loadPayments() {
+    var state = store.get();
+    if (state.loading) {
+      /* Remember the request and issue it once the current one finishes. The
+         list is already cleared by reload(), so this is a replace, not an
+         append — hence resetPaging() below too. Dropping the refresh instead
+         would leave the table the reload just cleared permanently empty. */
+      reloadPending = true;
+      return;
+    }
+    store.update({ loading: true });
+    setError($("list-error"), null);
+    announce("Loading payments");
+
+    /* Skeletons only on the first page (no cursor), so the "Load more" path
+       never inserts placeholders into an already-populated list. */
+    var isFirstPage = !state.cursor;
+    if (isFirstPage) showSkeletonRows(5);
+
+    api(buildListQuery(state))
+      .then(function (body) {
+        clearSkeletonRows();
+
+        var payments = body.payments || [];
+        var rows = store.get().loadedPayments.concat(payments);
+        store.update({ loadedPayments: rows });
+        renderRows();
+
+        /* The offset-mode response returns a cursor even on the final page, so
+           a short page is what actually signals the end. */
+        var more = payments.length === store.get().pageSize && !!body.next_cursor;
+        store.update({ cursor: more ? body.next_cursor : null });
+        show($("load-more"), more);
+
+        /* The search box narrows the loaded rows, so "nothing to show" is
+           either a filter that matched nothing or a genuinely empty account.
+           Only the latter deserves the full empty-state treatment. */
+        var visible = store.visiblePayments();
+        show($("empty"), visible.length === 0);
+        if (store.get().loadedPayments.length === 0) {
+          setListState(
+            buildEmptyState(
+              "📭",
+              "No payments found",
+              emptyMessageForFilter(store.get().status),
+              null
+            )
+          );
+        } else if (visible.length === 0) {
+          setListState(
+            buildEmptyState(
+              "🔍",
+              "No matches",
+              'Nothing matches "' +
+                store.get().search +
+                '". Clear the search box to see every loaded payment.',
+              null
+            )
+          );
+        } else {
+          clearListState();
+        }
+      })
+      .catch(function (err) {
+        clearSkeletonRows();
+        if (err.message !== "unauthorized") {
+          /* A structured state with a Retry button (#720) rather than a bare
+             error paragraph: the operator's next action is a click, not a
+             guess about what the message meant. */
+          setListState(
+            buildErrorState(err.message, function () {
+              clearListState();
+              reload();
+            })
+          );
+          setError($("list-error"), null);
+        }
+      })
+      .then(function () {
+        store.update({ loading: false });
+        if (reloadPending) {
+          reloadPending = false;
+          /* The response just applied is now stale, and its cursor points into
+             a result set the operator has already moved past, so the deferred
+             refresh starts from a clean paging state. */
+          store.resetPaging();
+          loadPayments();
+        }
+      });
+  }
+
+  function loadSummary() {
+    api("/payments/summary")
+      .then(function (body) {
+        var summary = $("summary");
+        clear(summary);
+        (body.summary || []).forEach(function (row) {
+          var card = el("div", "summary-card");
+          card.appendChild(el("span", "muted small", row[0]));
+          card.appendChild(el("strong", null, row[1]));
+          summary.appendChild(card);
+        });
+      })
+      .catch(function (err) {
+        clear($("summary"));
+        announce("Error loading summary: " + err.message);
+      });
+  }
+
+  /** Draw the currently visible rows, honouring the search box and `j`/`k`. */
+  function renderRows() {
+    var tbody = $("rows");
+    var visible = store.visiblePayments();
+    var active = store.get().activeRow;
+    clear(tbody);
+
+    visible.forEach(function (p, index) {
+      tbody.appendChild(rowFor(p, index === active));
+    });
+
+    show($("empty"), visible.length === 0);
+    announceRow(visible, active);
+  }
 
   /**
-   * Append `count` skeleton placeholder rows to the payments tbody.
-   * The rows carry class `skeleton-row` and are removed by `clearSkeletons()`
-   * once real data (or an error) arrives.
+   * Announce the highlighted row to assistive technology.
+   *
+   * The `j`/`k` highlight is otherwise a purely visual change: a sighted user
+   * sees the row move, a screen-reader user would hear nothing at all. This
+   * runs on every render, not just on keypress, so a filter change that moves
+   * the highlight is announced too.
+   */
+  function announceRow(visible, active) {
+    var node = $("rows-status");
+    if (!node) return;
+    if (active < 0 || active >= visible.length) {
+      node.textContent = visible.length
+        ? visible.length + (visible.length === 1 ? " payment" : " payments")
+        : "";
+      return;
+    }
+    var p = visible[active];
+    node.textContent =
+      "Row " +
+      (active + 1) +
+      " of " +
+      visible.length +
+      ": " +
+      p.status +
+      ", " +
+      formatAmount(p.amount, p.asset) +
+      ", memo " +
+      p.memo;
+  }
+
+  /* ── Skeleton helpers (#719) ─────────────────────────────────────────── */
+
+  /**
+   * Append `count` skeleton placeholder rows to the payments tbody. Removed by
+   * `clearSkeletonRows()` once real data — or an error — arrives.
+   *
+   * `aria-hidden` because the row count is already announced separately: a
+   * screen reader that reads five rows of "Status Amount Memo" gains nothing
+   * and is interrupted mid-sentence by the real rows replacing them.
    */
   function showSkeletonRows(count) {
     var tbody = $("rows");
@@ -363,6 +536,7 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
 
   function clearSkeletonRows() {
     var tbody = $("rows");
+    if (!tbody) return;
     var skeletons = tbody.querySelectorAll(".skeleton-row");
     for (var i = 0; i < skeletons.length; i++) {
       tbody.removeChild(skeletons[i]);
@@ -378,13 +552,13 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     clear(fields);
 
     var rows = [
-      { dtWidth: "4rem",  ddCls: "skeleton-field skeleton-field-short" },
-      { dtWidth: "4rem",  ddCls: "skeleton-field skeleton-field-short" },
-      { dtWidth: "5rem",  ddCls: "skeleton-field skeleton-field-long"  },
-      { dtWidth: "6rem",  ddCls: "skeleton-field skeleton-field-full"  },
-      { dtWidth: "5rem",  ddCls: "skeleton-field skeleton-field-full"  },
-      { dtWidth: "6rem",  ddCls: "skeleton-field skeleton-field-long"  },
-      { dtWidth: "4rem",  ddCls: "skeleton-field skeleton-field-short" },
+      { dtWidth: "4rem", ddCls: "skeleton-field skeleton-field-short" },
+      { dtWidth: "4rem", ddCls: "skeleton-field skeleton-field-short" },
+      { dtWidth: "5rem", ddCls: "skeleton-field skeleton-field-long" },
+      { dtWidth: "6rem", ddCls: "skeleton-field skeleton-field-full" },
+      { dtWidth: "5rem", ddCls: "skeleton-field skeleton-field-full" },
+      { dtWidth: "6rem", ddCls: "skeleton-field skeleton-field-long" },
+      { dtWidth: "4rem", ddCls: "skeleton-field skeleton-field-short" },
     ];
 
     rows.forEach(function (row) {
@@ -403,17 +577,11 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     });
   }
 
-  // ── Empty / error state helpers (#720) ────────────────────────────────
+  /* ── Empty / error state helpers (#720) ──────────────────────────────── */
 
   /**
-   * Build a structured empty-state node with an icon, title, message, and an
+   * Build a structured empty-state node: icon, title, explanation, and an
    * optional retry button.
-   *
-   * @param {string} icon      Emoji or symbol for the icon.
-   * @param {string} title     Short heading.
-   * @param {string} message   Longer explanation paragraph.
-   * @param {Function|null} onRetry  Callback for the Retry button; omit for
-   *                                  empty (not error) states.
    */
   function buildEmptyState(icon, title, message, onRetry) {
     var wrap = el("div", "empty-state");
@@ -436,17 +604,10 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     return wrap;
   }
 
-  /**
-   * Build a structured error-state node with a message and a retry button.
-   *
-   * @param {string}   message  Human-readable error text.
-   * @param {Function} onRetry  Callback for the Retry button.
-   */
+  /** Build a structured error-state node with a retry button. */
   function buildErrorState(message, onRetry) {
     var wrap = el("div", "error-state");
-
-    var msg = el("p", "error-state-message", message);
-    wrap.appendChild(msg);
+    wrap.appendChild(el("p", "error-state-message", message));
 
     var btn = el("button", "ghost", "Retry");
     btn.type = "button";
@@ -456,9 +617,7 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     return wrap;
   }
 
-  /**
-   * Return an empty-state message tailored to the active status filter.
-   */
+  /** An empty-state message tailored to the active status filter. */
   function emptyMessageForFilter(status) {
     switch (status) {
       case "pending":
@@ -482,8 +641,7 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     clear($("rows"));
     // Clear any previous empty/error state injected into the list area.
     var prev = $("list-state");
-    if (prev) prev.parentNode.removeChild(prev);
-    loadPayments();
+    if (prev && prev.parentNode) prev.parentNode.removeChild(prev);
   }
 
   /* Set while a request is in flight, so a refresh arriving mid-flight is

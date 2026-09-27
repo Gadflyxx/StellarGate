@@ -150,11 +150,13 @@ async fn seed_pending_payment(pool: &db::Db, webhook_url: Option<&str>) -> Strin
 
 /// Build a 5 XLM Horizon payment operation for the seeded intent.
 ///
-/// `paging_token` must be unique per operation — Horizon encodes the ledger,
-/// transaction position, and operation index into this value.  Passing
-/// different tokens for op 0 and op 1 of the same transaction simulates what
-/// Horizon actually returns for a multi-operation transaction.
-fn make_half_payment(paging_token: &str) -> HorizonPayment {
+/// `operation_index` must be distinct per operation, and is what the dedup key
+/// is built from (issue #613). `paging_token` is set to a realistic *opaque*
+/// Horizon string, deliberately non-numeric: the gateway must read the index
+/// from the `operation_index` field, and this fixture fails if it is ever
+/// derived by parsing the token instead.
+fn make_half_payment(operation_index: i64) -> HorizonPayment {
+    let paging_token = format!("12884901985-{operation_index}-abc123def456");
     HorizonPayment {
         kind: "payment".into(),
         // Added by #614/#615: the dedup key is (payment_id, tx_hash,
@@ -173,8 +175,11 @@ fn make_half_payment(paging_token: &str) -> HorizonPayment {
             memo_type: Some("text".into()),
             successful: Some(true),
         }),
-        paging_token: Some(paging_token.into()),
+        paging_token: Some(paging_token),
         created_at: None,
+        // Mirrors what Horizon returns, and the value the dedup key is built
+        // from (issue #613).
+        operation_index,
     }
 }
 
@@ -232,10 +237,11 @@ async fn multi_op_same_tx_credits_full_amount() {
     let payment_id = seed_pending_payment(&pool, Some(&webhook_url)).await;
     let state = make_state(pool.clone(), Some(webhook_url));
 
-    // Op 0: first 5 XLM operation — different paging token → operation_index 100
-    let op0 = make_half_payment("100");
-    // Op 1: second 5 XLM operation in the same tx — paging token → operation_index 101
-    let op1 = make_half_payment("101");
+    // Op 0: first 5 XLM operation of the shared transaction.
+    let op0 = make_half_payment(0);
+    // Op 1: second 5 XLM operation in the same tx — a distinct operation index
+    // is the only thing that lets both be credited.
+    let op1 = make_half_payment(1);
 
     // Process op 0 — intent goes underpaid (5 of 10 XLM received).
     //
@@ -332,8 +338,8 @@ async fn multi_op_idempotent_on_rescan() {
     let payment_id = seed_pending_payment(&pool, Some(&webhook_url)).await;
     let state = make_state(pool.clone(), Some(webhook_url));
 
-    let op0 = make_half_payment("200");
-    let op1 = make_half_payment("201");
+    let op0 = make_half_payment(0);
+    let op1 = make_half_payment(1);
 
     // First pass: settle the intent.
     reconcile_payment(&state, &op0).await.unwrap();
@@ -432,6 +438,9 @@ async fn single_op_tx_still_works() {
         }),
         paging_token: Some("300".into()),
         created_at: None,
+        // A single-operation transaction is operation 0 within its own
+        // transaction (issue #613).
+        operation_index: 0,
     };
 
     let settled = reconcile_payment(&state, &hp)
