@@ -197,7 +197,7 @@ deploy. Sign in with any merchant API key.
 
 | View | What it does |
 |---|---|
-| Payments | Table of the merchant's payments, filterable by status, paged with the keyset cursor |
+| Payments | Table of the merchant's payments, filterable by one or more statuses, paged with the keyset cursor |
 | Payment detail | Full record — amounts, memo, destination, transaction hash, timestamps |
 | Webhook deliveries | Every attempt for a payment, with a one-click **Redeliver** |
 | Health | Live `/ready` indicator, polled every 30s |

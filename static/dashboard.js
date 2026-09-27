@@ -44,16 +44,21 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
   var API_BASE = "/v1";
   var KEY_NAME = "stellargate.apiKey";
   var KEY_SAVED_AT = "stellargate.apiKeySavedAt";
+  var STATUSES = ["pending", "completed", "underpaid", "expired"];
 
   var state = {
     key: null,
-    status: "",
+    // Pressed status chips, in STATUSES order. Empty means "All".
+    statuses: [],
     pageSize: 25,
     createdAfter: "",
     createdBefore: "",
     cursor: null,
     loading: false,
     loadedPayments: [],
+    // Selected payments keyed by id, holding the row's payment record so the
+    // selection can be exported without re-fetching.
+    selected: {},
     autoRefresh: false,
     // The table row that opened the detail drawer, so focus can be handed back
     // to it on close. See `closeDetail`.
@@ -176,7 +181,11 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
         if (kv.length !== 2) return;
         var key = decodeURIComponent(kv[0]);
         var value = decodeURIComponent(kv[1]);
-        if (key === "status") state.status = value;
+        if (key === "status") {
+          state.statuses = STATUSES.filter(function (s) {
+            return value.split(",").indexOf(s) >= 0;
+          });
+        }
         if (key === "autoRefresh") state.autoRefresh = value === "1";
       });
     } catch (e) {
@@ -187,13 +196,54 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
   function writeHashState() {
     try {
       var parts = [];
-      if (state.status) parts.push("status=" + encodeURIComponent(state.status));
+      if (state.statuses.length) {
+        parts.push("status=" + state.statuses.map(encodeURIComponent).join(","));
+      }
       if (state.autoRefresh) parts.push("autoRefresh=1");
       var hash = parts.length ? "#" + parts.join("&") : "";
       window.history.replaceState(null, "", window.location.pathname + window.location.search + hash);
     } catch (e) {
       /* non-fatal */
     }
+  }
+
+  // ── Date range presets (#778) ──────────────────────────────────────────
+
+  /** Format a Date as a date input's YYYY-MM-DD value, in local time. */
+  function localDateValue(d) {
+    function pad(n) {
+      return (n < 10 ? "0" : "") + n;
+    }
+    return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate());
+  }
+
+  /**
+   * The start or end of a local calendar day as a UTC timestamp in the API's
+   * stored format (no milliseconds), so a day means the user's own day.
+   */
+  function localDayBound(value, endOfDay) {
+    var parts = value.split("-").map(Number);
+    var d = endOfDay
+      ? new Date(parts[0], parts[1] - 1, parts[2], 23, 59, 59)
+      : new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0);
+    return d.toISOString().replace(/\.\d{3}Z$/, "Z");
+  }
+
+  /** From/To input values covering the last `days` local days, today included. */
+  function presetRange(days) {
+    var today = new Date();
+    var from = new Date(today.getFullYear(), today.getMonth(), today.getDate() - (days - 1));
+    return { from: localDateValue(from), to: localDateValue(today) };
+  }
+
+  /** Highlight the preset whose range matches the current date inputs. */
+  function syncPresetUi() {
+    Array.prototype.forEach.call(document.querySelectorAll(".preset"), function (btn) {
+      var range = presetRange(Number(btn.getAttribute("data-days")));
+      var isActive = state.createdAfter === range.from && state.createdBefore === range.to;
+      btn.className = isActive ? "ghost preset preset-on" : "ghost preset";
+      btn.setAttribute("aria-pressed", isActive ? "true" : "false");
+    });
   }
 
   // ── API ───────────────────────────────────────────────────────────────
@@ -293,6 +343,7 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
       tr.setAttribute("aria-hidden", "true");
 
       var cols = [
+        { label: "Select",     cls: "sk-select" },
         { label: "Status",     cls: "sk-status" },
         { label: "Amount",     cls: "sk-amount" },
         { label: "Memo",       cls: "sk-memo" },
@@ -455,9 +506,13 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     announce("Loading payments");
 
     var query = "/payments?limit=" + state.pageSize;
-    if (state.status) query += "&status=" + encodeURIComponent(state.status);
-    if (state.createdAfter) query += "&created_after=" + encodeURIComponent(state.createdAfter + "T00:00:00Z");
-    if (state.createdBefore) query += "&created_before=" + encodeURIComponent(state.createdBefore + "T23:59:59Z");
+    // The list API accepts a single `status`. With one chip pressed the server
+    // filters; with several, unfiltered pages are fetched and filtered below.
+    // Known limitation: a page can then hold fewer matching rows than the page
+    // size (even none) while "Load more" still has further pages to fetch.
+    if (state.statuses.length === 1) query += "&status=" + encodeURIComponent(state.statuses[0]);
+    if (state.createdAfter) query += "&created_after=" + encodeURIComponent(localDayBound(state.createdAfter, false));
+    if (state.createdBefore) query += "&created_before=" + encodeURIComponent(localDayBound(state.createdBefore, true));
     if (state.cursor) query += "&cursor=" + encodeURIComponent(state.cursor);
 
     // Show skeleton rows only on the first page load (no cursor yet), so the
@@ -470,8 +525,14 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
         clearSkeletonRows();
 
         var payments = body.payments || [];
-        state.loadedPayments = state.loadedPayments.concat(payments);
-        payments.forEach(appendRow);
+        var shown = state.statuses.length > 1
+          ? payments.filter(function (p) {
+              return state.statuses.indexOf(p.status) >= 0;
+            })
+          : payments;
+        state.loadedPayments = state.loadedPayments.concat(shown);
+        shown.forEach(appendRow);
+        syncSelectionUi();
 
         // Remove any previous inline state nodes before rendering new ones.
         var prev = $("list-state");
@@ -484,11 +545,13 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
         show($("load-more"), more);
 
         // #720: show filter-tailored empty state when the list is empty.
-        if ($("rows").childElementCount === 0) {
+        if ($("rows").childElementCount === 0 && !more) {
           var emptyNode = buildEmptyState(
             "📭",
             "No payments found",
-            emptyMessageForFilter(state.status),
+            state.statuses.length > 1
+              ? "No payments match the selected statuses."
+              : emptyMessageForFilter(state.statuses[0] || ""),
             null
           );
           emptyNode.id = "list-state";
@@ -542,6 +605,7 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
           card.appendChild(el("strong", null, row[1]));
           summary.appendChild(card);
         });
+        renderChipCounts(body.summary || []);
       })
       .catch(function (err) {
         clear($("summary"));
@@ -612,6 +676,32 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
          so tabbing into the table does not restart at row 1. */
       tr.setAttribute("aria-current", "true");
     }
+
+    // Keep the stored record fresh when a selected row is reloaded.
+    if (state.selected[p.id]) state.selected[p.id] = p;
+
+    var selectCell = document.createElement("td");
+    selectCell.setAttribute("data-label", "Select");
+    var box = document.createElement("input");
+    box.type = "checkbox";
+    box.className = "row-select";
+    box.setAttribute("data-id", p.id);
+    box.setAttribute("aria-label", "Select payment " + p.id);
+    box.checked = !!state.selected[p.id];
+    // Stop the row's click and Enter/Space handlers from opening the detail
+    // panel when the checkbox is toggled.
+    box.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+    });
+    box.addEventListener("keydown", function (ev) {
+      ev.stopPropagation();
+    });
+    box.addEventListener("change", function () {
+      setSelected(p, box.checked);
+      syncSelectionUi();
+    });
+    selectCell.appendChild(box);
+    tr.appendChild(selectCell);
 
     var statusCell = document.createElement("td");
     statusCell.setAttribute("data-label", "Status");
@@ -844,7 +934,7 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     var url = URL.createObjectURL(blob);
     var a = document.createElement("a");
     a.href = url;
-    a.download = "stellargate-payments.csv";
+    a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -905,7 +995,8 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
 
   function syncFilterUi() {
     Array.prototype.forEach.call(document.querySelectorAll(".chip"), function (chip) {
-      var isActive = (chip.getAttribute("data-status") || "") === state.status;
+      var status = chip.getAttribute("data-status") || "";
+      var isActive = status ? state.statuses.indexOf(status) >= 0 : state.statuses.length === 0;
       chip.className = isActive ? "chip chip-on" : "chip";
       chip.setAttribute("aria-pressed", isActive ? "true" : "false");
     });
@@ -1046,8 +1137,23 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
       signOut(null);
     });
 
-    $("refresh").addEventListener("click", reload);
-    $("export-csv").addEventListener("click", exportCsv);
+    $("refresh").addEventListener("click", function () {
+      loadSummary();
+      reload();
+    });
+    $("export-csv").addEventListener("click", function () {
+      exportCsv(state.loadedPayments, "stellargate-payments.csv");
+    });
+    $("export-selected").addEventListener("click", function () {
+      exportCsv(selectedPayments(), "stellargate-payments-selected.csv");
+    });
+    $("select-all").addEventListener("change", function () {
+      var on = $("select-all").checked;
+      state.loadedPayments.forEach(function (p) {
+        setSelected(p, on);
+      });
+      syncSelectionUi();
+    });
     $("page-size").addEventListener("change", function () {
       var n = Number($("page-size").value) || 25;
       store.update({ pageSize: n });
