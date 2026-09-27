@@ -5,6 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>StellarGate Dashboard</title>
     <link rel="stylesheet" href="/dashboard/app.css" />
+    <!-- Applies the stored theme preference before the first paint. Must be a
+         classic script in <head>: a module is deferred, so it would run after
+         the page has already painted in the OS palette and flash. A separate
+         file rather than an inline block because the dashboard CSP is
+         `script-src 'self'` with no `unsafe-inline`. See #713. -->
+    <script src="/dashboard/theme.js"></script>
     <link
       rel="icon"
       href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>&#9733;</text></svg>"
@@ -22,7 +28,24 @@
            the API key in the URL and the browser history. A POST lands the key
            in a request body that this route answers with 405. -->
       <form id="gate-form" class="card gate-card" method="post" autocomplete="off">
-        <h1>StellarGate</h1>
+        <div class="gate-head">
+          <h1>StellarGate</h1>
+          <!-- The theme control appears here and in the top bar because both
+               panels are individually visible states of the same page:
+               whichever one is on screen should offer the override.
+               `data-theme-toggle` is what the script binds, so both stay in
+               sync from one handler. -->
+          <button
+            type="button"
+            class="ghost theme-toggle"
+            data-theme-toggle
+            aria-pressed="false"
+            title="Switch to dark theme"
+          >
+            <span class="theme-icon" aria-hidden="true">&#9788;</span>
+            <span class="visually-hidden">Dark theme</span>
+          </button>
+        </div>
         <p class="muted">Sign in with a merchant API key to view payments.</p>
         <label for="api-key">API key</label>
         <input
@@ -59,6 +82,16 @@
           <span id="health" class="pill pill-idle" title="Gateway health">
             checking&hellip;
           </span>
+          <button
+            type="button"
+            class="ghost theme-toggle"
+            data-theme-toggle
+            aria-pressed="false"
+            title="Switch to dark theme"
+          >
+            <span class="theme-icon" aria-hidden="true">&#9788;</span>
+            <span class="visually-hidden">Dark theme</span>
+          </button>
           <button id="sign-out" class="ghost">Sign out</button>
         </div>
       </header>
@@ -66,6 +99,29 @@
       <main>
         <div id="live-region" class="sr-only" aria-live="polite" aria-atomic="true"></div>
         <section class="toolbar">
+          <!-- aria-label overrides the visible <span> as the accessible name,
+               so "Search" identifies one control rather than a label and an
+               input with the same text. -->
+          <div class="search">
+            <label class="small muted" for="search">Search</label>
+            <input
+              id="search"
+              type="search"
+              aria-label="Search payments"
+              placeholder="Memo or payment ID"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <button
+              id="search-clear"
+              class="ghost"
+              type="button"
+              aria-label="Clear search"
+              hidden
+            >
+              &times;
+            </button>
+          </div>
           <div class="filters" role="group" aria-label="Filter by status">
             <button class="chip chip-on" data-status="" data-label="All" aria-pressed="true">All</button>
             <button class="chip" data-status="pending" data-label="Pending" aria-pressed="false">Pending</button>
@@ -82,6 +138,10 @@
             <button class="ghost preset" type="button" data-days="7" aria-pressed="false">Last 7 days</button>
             <button class="ghost preset" type="button" data-days="30" aria-pressed="false">Last 30 days</button>
           </div>
+          <label class="small checkbox" for="auto-refresh">
+            <input id="auto-refresh" type="checkbox" />
+            <span>Auto-refresh</span>
+          </label>
           <label class="small" for="page-size">Page size</label>
           <select id="page-size">
             <option>10</option>
@@ -97,12 +157,15 @@
           <span id="selection-count" class="muted small" hidden></span>
           <button id="export-selected" class="ghost" hidden>Export selected</button>
           <button id="refresh" class="ghost">Refresh</button>
+          <button id="help-open" class="ghost" aria-haspopup="dialog">
+            Shortcuts&nbsp;<kbd>?</kbd>
+          </button>
         </section>
 
         <section id="summary" class="summary" aria-label="Payment summary"></section>
 
         <section class="card">
-          <table class="payments">
+          <table class="payments" aria-label="Payments">
             <thead>
               <tr>
                 <th class="select-col">
@@ -119,16 +182,38 @@
           </table>
           <p id="empty" class="empty" hidden>No payments match this filter.</p>
           <p id="list-error" class="error" hidden></p>
+          <!-- Announces the j/k highlight. Without it the row selection is a
+               purely visual change that a screen-reader user cannot perceive. -->
+          <p id="rows-status" class="muted small" role="status" aria-live="polite"></p>
           <div class="table-foot">
             <button id="load-more" class="ghost" hidden>Load more</button>
           </div>
         </section>
       </main>
 
-      <!-- Detail panel, opened by clicking a row. -->
-      <aside id="detail" class="detail" hidden aria-label="Payment detail">
+      <!-- Detail panel, opened by clicking a row.
+
+           A real <dialog> rather than an <aside> (issue #715): `showModal()`
+           puts it in the top layer, which is what makes the rest of the page
+           genuinely unreachable rather than merely covered by a scrim, and
+           brings the ::backdrop, Escape handling and the UA's own focus
+           restoration with it.
+
+           `aria-modal` is the attribute assistive tech reads, and
+           `aria-labelledby` names the dialog from its heading, so a screen
+           reader announces "Payment, dialog" on entry instead of a bare
+           "dialog".
+
+           The explicit Tab trap from #714 stays: a modal dialog does not wrap
+           Tab at the ends in any current browser. -->
+      <dialog
+        id="detail"
+        class="detail"
+        aria-modal="true"
+        aria-labelledby="detail-title"
+      >
         <div class="detail-head">
-          <h2>Payment</h2>
+          <h2 id="detail-title">Payment</h2>
           <button id="detail-close" class="ghost" aria-label="Close">&times;</button>
         </div>
         <dl id="detail-fields" class="fields"></dl>
@@ -139,8 +224,33 @@
         </p>
         <p id="deliveries-error" class="error" hidden></p>
         <ul id="deliveries" class="deliveries"></ul>
-      </aside>
-      <div id="scrim" class="scrim" hidden></div>
+      </dialog>
+    </div>
+
+    <!-- Keyboard shortcut help (#721).
+         The list is rendered from the SHORTCUTS table in keys.js, so a shortcut
+         cannot exist without appearing here and cannot be documented with the
+         wrong key. Rendered as a dialog so it is announced as one, and kept out
+         of #app so it is reachable from anywhere the app is. -->
+    <div
+      id="help"
+      class="help"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="help-title"
+      hidden
+    >
+      <div class="help-panel card">
+        <div class="detail-head">
+          <h2 id="help-title">Keyboard shortcuts</h2>
+          <button id="help-close" class="ghost" aria-label="Close">&times;</button>
+        </div>
+        <ul id="help-list" class="help-list"></ul>
+        <p class="muted small">
+          Shortcuts are ignored while you are typing in a field. Press
+          <kbd>Esc</kbd> to close this panel.
+        </p>
+      </div>
     </div>
 
     <script type="module" src="/dashboard/app.js"></script>
