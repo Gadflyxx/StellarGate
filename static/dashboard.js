@@ -42,18 +42,30 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
      end up with the prefix doubled. Pinned by `tests/dashboard_asset_tests.rs`,
      which counts the occurrences of the prefix across this file. */
   var API_BASE = "/v1";
+  var KEY_NAME = "stellargate.apiKey";
+  var KEY_SAVED_AT = "stellargate.apiKeySavedAt";
+  var STATUSES = ["pending", "completed", "underpaid", "expired"];
 
-  var store = createStore();
-  var session = createSessionStore({
-    session: safeArea(function () {
-      return window.sessionStorage;
-    }),
-    local: safeArea(function () {
-      return window.localStorage;
-    }),
-  });
+  var state = {
+    key: null,
+    // Pressed status chips, in STATUSES order. Empty means "All".
+    statuses: [],
+    pageSize: 25,
+    createdAfter: "",
+    createdBefore: "",
+    cursor: null,
+    loading: false,
+    loadedPayments: [],
+    // Selected payments keyed by id, holding the row's payment record so the
+    // selection can be exported without re-fetching.
+    selected: {},
+    autoRefresh: false,
+    // The table row that opened the detail drawer, so focus can be handed back
+    // to it on close. See `closeDetail`.
+    detailTrigger: null,
+  };
 
-  /* ── Tiny DOM helpers ────────────────────────────────────────────────── */
+  // ── Tiny DOM helpers ──────────────────────────────────────────────────
 
   function $(id) {
     return document.getElementById(id);
@@ -87,24 +99,154 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     }
   }
 
-  /**
-   * A Web Storage area, or null when the browser refuses to hand one over.
-   *
-   * Merely *reading* `window.localStorage` throws in Safari private mode and
-   * wherever storage is blocked by policy, so it is touched lazily and the
-   * session store is told to fall back to memory (issue #678). Losing
-   * persistence must degrade to "re-enter the key on reload", never to a blank
-   * page.
-   */
-  function safeArea(get) {
+  /** Announce a message to screen readers via the live region. */
+  function announce(message) {
+    var live = $("live-region");
+    if (live) live.textContent = message;
+  }
+
+  // ── Formatting ────────────────────────────────────────────────────────
+
+  /** Map a payment or delivery status onto a pill style. */
+  function pillClass(status) {
+    switch (status) {
+      case "completed":
+      case "delivered":
+        return "pill pill-ok";
+      case "pending":
+      case "underpaid":
+        return "pill pill-warn";
+      case "expired":
+      case "failed":
+        return "pill pill-err";
+      default:
+        return "pill pill-idle";
+    }
+  }
+
+  /** Format a payment amount with its asset code. */
+  function formatAmount(amount, asset) {
+    if (!amount) return "—";
+    return amount + " " + (asset || "XLM");
+  }
+
+  /** Return a Stellar expert explorer URL for a transaction hash. */
+  function explorerTx(hash) {
+    return "https://stellar.expert/explorer/public/tx/" + encodeURIComponent(hash);
+  }
+
+  /** Human-readable relative time (e.g. "2 min ago", "just now"). */
+  function relativeTime(iso) {
+    if (!iso) return "—";
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return iso;
+    var diffMs = Date.now() - d.getTime();
+    var diffSec = Math.round(diffMs / 1000);
+    if (diffSec < 5) return "just now";
+    if (diffSec < 60) return diffSec + "s ago";
+    var diffMin = Math.round(diffSec / 60);
+    if (diffMin < 60) return diffMin + " min ago";
+    var diffHr = Math.round(diffMin / 60);
+    if (diffHr < 24) return diffHr + "h ago";
+    return Math.round(diffHr / 24) + "d ago";
+  }
+
+  /** Human-readable countdown to an ISO timestamp (e.g. "5m 32s"). */
+  function countdown(iso) {
+    if (!iso) return "";
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return "";
+    var diffMs = d.getTime() - Date.now();
+    if (diffMs <= 0) return "expired";
+    var totalSec = Math.floor(diffMs / 1000);
+    var h = Math.floor(totalSec / 3600);
+    var m = Math.floor((totalSec % 3600) / 60);
+    var s = totalSec % 60;
+    if (h > 0) return h + "h " + m + "m";
+    if (m > 0) return m + "m " + s + "s";
+    return s + "s";
+  }
+
+  // ── Hash-state persistence ─────────────────────────────────────────────
+  // Stores the active status filter and auto-refresh flag in the URL hash so
+  // the user can bookmark or share a pre-filtered view.
+
+  function readHashState() {
     try {
-      return get();
+      var hash = window.location.hash.slice(1);
+      if (!hash) return;
+      var parts = hash.split("&");
+      parts.forEach(function (part) {
+        var kv = part.split("=");
+        if (kv.length !== 2) return;
+        var key = decodeURIComponent(kv[0]);
+        var value = decodeURIComponent(kv[1]);
+        if (key === "status") {
+          state.statuses = STATUSES.filter(function (s) {
+            return value.split(",").indexOf(s) >= 0;
+          });
+        }
+        if (key === "autoRefresh") state.autoRefresh = value === "1";
+      });
+    } catch (e) {
+      /* non-fatal */
+    }
+  }
+
+  function writeHashState() {
+    try {
+      var parts = [];
+      if (state.statuses.length) {
+        parts.push("status=" + state.statuses.map(encodeURIComponent).join(","));
+      }
+      if (state.autoRefresh) parts.push("autoRefresh=1");
+      var hash = parts.length ? "#" + parts.join("&") : "";
+      window.history.replaceState(null, "", window.location.pathname + window.location.search + hash);
     } catch (e) {
       return null;
     }
   }
 
-  /* ── API ─────────────────────────────────────────────────────────────── */
+  // ── Date range presets (#778) ──────────────────────────────────────────
+
+  /** Format a Date as a date input's YYYY-MM-DD value, in local time. */
+  function localDateValue(d) {
+    function pad(n) {
+      return (n < 10 ? "0" : "") + n;
+    }
+    return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate());
+  }
+
+  /**
+   * The start or end of a local calendar day as a UTC timestamp in the API's
+   * stored format (no milliseconds), so a day means the user's own day.
+   */
+  function localDayBound(value, endOfDay) {
+    var parts = value.split("-").map(Number);
+    var d = endOfDay
+      ? new Date(parts[0], parts[1] - 1, parts[2], 23, 59, 59)
+      : new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0);
+    return d.toISOString().replace(/\.\d{3}Z$/, "Z");
+  }
+
+  /** From/To input values covering the last `days` local days, today included. */
+  function presetRange(days) {
+    var today = new Date();
+    var from = new Date(today.getFullYear(), today.getMonth(), today.getDate() - (days - 1));
+    return { from: localDateValue(from), to: localDateValue(today) };
+  }
+
+  /** Highlight the preset whose range matches the current date inputs. */
+  function syncPresetUi() {
+    Array.prototype.forEach.call(document.querySelectorAll(".preset"), function (btn) {
+      var range = presetRange(Number(btn.getAttribute("data-days")));
+      var isActive = state.createdAfter === range.from && state.createdBefore === range.to;
+      btn.className = isActive ? "ghost preset preset-on" : "ghost preset";
+      btn.setAttribute("aria-pressed", isActive ? "true" : "false");
+    });
+  }
+
+  // ── API ───────────────────────────────────────────────────────────────
 
   /**
    * Call the gateway. Resolves with the parsed body, or rejects with an Error
@@ -374,10 +516,11 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
       tr.setAttribute("aria-hidden", "true");
 
       var cols = [
-        { label: "Status", cls: "sk-status" },
-        { label: "Amount", cls: "sk-amount" },
-        { label: "Memo", cls: "sk-memo" },
-        { label: "Created", cls: "sk-date" },
+        { label: "Select",     cls: "sk-select" },
+        { label: "Status",     cls: "sk-status" },
+        { label: "Amount",     cls: "sk-amount" },
+        { label: "Memo",       cls: "sk-memo" },
+        { label: "Created",    cls: "sk-date" },
         { label: "Payment ID", cls: "sk-id" },
       ];
       cols.forEach(function (col) {
@@ -490,24 +633,188 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     }
   }
 
-  /** Remove a previously injected empty/error node, if one is on screen. */
-  function clearListState() {
+  // ── Payments list ─────────────────────────────────────────────────────
+
+  function reload() {
+    store.resetPaging();
+    store.update({ loadedPayments: [] });
+    clear($("rows"));
+    // Clear any previous empty/error state injected into the list area.
     var prev = $("list-state");
     if (prev && prev.parentNode) prev.parentNode.removeChild(prev);
   }
 
-  /** Insert a node just after the payments table. */
-  function setListState(node) {
-    clearListState();
-    node.id = "list-state";
-    var rows = $("rows");
-    rows.parentNode.insertBefore(node, rows.nextSibling);
+  /* Set while a request is in flight, so a refresh arriving mid-flight is
+     deferred rather than dropped. Dropping it would leave the table the reload
+     just cleared permanently empty; letting it run concurrently would let two
+     responses both append, doubling the list. */
+  var reloadPending = false;
+
+  function loadPayments() {
+    var state = store.get();
+    if (state.loading) {
+      /* Remember the request and issue it once the current one finishes. The
+         list is already cleared by reload(), so this is a replace, not an
+         append — hence resetPaging() here too. */
+      reloadPending = true;
+      return;
+    }
+    store.update({ loading: true });
+    setError($("list-error"), null);
+    announce("Loading payments");
+
+    var query = "/payments?limit=" + state.pageSize;
+    // The list API accepts a single `status`. With one chip pressed the server
+    // filters; with several, unfiltered pages are fetched and filtered below.
+    // Known limitation: a page can then hold fewer matching rows than the page
+    // size (even none) while "Load more" still has further pages to fetch.
+    if (state.statuses.length === 1) query += "&status=" + encodeURIComponent(state.statuses[0]);
+    if (state.createdAfter) query += "&created_after=" + encodeURIComponent(localDayBound(state.createdAfter, false));
+    if (state.createdBefore) query += "&created_before=" + encodeURIComponent(localDayBound(state.createdBefore, true));
+    if (state.cursor) query += "&cursor=" + encodeURIComponent(state.cursor);
+
+    // Show skeleton rows only on the first page load (no cursor yet), so the
+    // "Load more" path doesn't insert skeletons into an already-populated list.
+    var isFirstPage = !state.cursor;
+    if (isFirstPage) showSkeletonRows(5);
+
+    api(query)
+      .then(function (body) {
+        clearSkeletonRows();
+
+        var payments = body.payments || [];
+        var shown = state.statuses.length > 1
+          ? payments.filter(function (p) {
+              return state.statuses.indexOf(p.status) >= 0;
+            })
+          : payments;
+        state.loadedPayments = state.loadedPayments.concat(shown);
+        shown.forEach(appendRow);
+        syncSelectionUi();
+
+        // Remove any previous inline state nodes before rendering new ones.
+        var prev = $("list-state");
+        if (prev) prev.parentNode.removeChild(prev);
+
+        // The offset-mode response returns a cursor even on the final page, so
+        // a short page is what actually signals the end.
+        var more = payments.length === state.pageSize && !!body.next_cursor;
+        state.cursor = more ? body.next_cursor : null;
+        show($("load-more"), more);
+
+        // #720: show filter-tailored empty state when the list is empty.
+        if ($("rows").childElementCount === 0 && !more) {
+          var emptyNode = buildEmptyState(
+            "📭",
+            "No payments found",
+            state.statuses.length > 1
+              ? "No payments match the selected statuses."
+              : emptyMessageForFilter(state.statuses[0] || ""),
+            null
+          );
+          emptyNode.id = "list-state";
+          $("rows").parentNode.insertBefore(emptyNode, $("rows").nextSibling);
+          show($("empty"), false);
+        } else {
+          show($("empty"), false);
+        }
+      })
+      .catch(function (err) {
+        clearSkeletonRows();
+
+        // Remove any previous inline state nodes before rendering error.
+        var prev = $("list-state");
+        if (prev) prev.parentNode.removeChild(prev);
+
+        if (err.message !== "unauthorized") {
+          // #720: replace the inline error paragraph with a structured error
+          // state that includes a Retry button.
+          var errNode = buildErrorState(err.message, function () {
+            var stateNode = $("list-state");
+            if (stateNode) stateNode.parentNode.removeChild(stateNode);
+            reload();
+          });
+          errNode.id = "list-state";
+          $("rows").parentNode.insertBefore(errNode, $("rows").nextSibling);
+          setError($("list-error"), null);
+        }
+      })
+      .then(function () {
+        store.update({ loading: false });
+        if (reloadPending) {
+          reloadPending = false;
+          /* The response just applied is now stale, and its cursor points into
+             a result set the operator has already moved past, so the deferred
+             refresh starts from a clean paging state. */
+          store.resetPaging();
+          loadPayments();
+        }
+      });
   }
 
-  /** Announce a message to screen readers via the live region. */
-  function announce(message) {
-    var live = $("live-region");
-    if (live) live.textContent = message;
+  function loadSummary() {
+    api("/payments/summary")
+      .then(function (body) {
+        var summary = $("summary");
+        clear(summary);
+        (body.summary || []).forEach(function (row) {
+          var card = el("div", "summary-card");
+          card.appendChild(el("span", "muted small", row[0]));
+          card.appendChild(el("strong", null, row[1]));
+          summary.appendChild(card);
+        });
+        renderChipCounts(body.summary || []);
+      })
+      .catch(function (err) {
+        clear($("summary"));
+        announce("Error loading summary: " + err.message);
+      });
+  }
+
+  /** Draw the currently visible rows, honouring the search box and `j`/`k`. */
+  function renderRows() {
+    var tbody = $("rows");
+    var visible = store.visiblePayments();
+    var active = store.get().activeRow;
+    clear(tbody);
+
+    visible.forEach(function (p, index) {
+      tbody.appendChild(rowFor(p, index === active));
+    });
+
+    show($("empty"), visible.length === 0);
+    announceRow(visible, active);
+  }
+
+  /**
+   * Announce the highlighted row to assistive technology.
+   *
+   * The `j`/`k` highlight is otherwise a purely visual change: a sighted user
+   * sees the row move, a screen-reader user would hear nothing at all. This
+   * runs on every render, not just on keypress, so a filter change that moves
+   * the highlight is announced too.
+   */
+  function announceRow(visible, active) {
+    var node = $("rows-status");
+    if (!node) return;
+    if (active < 0 || active >= visible.length) {
+      node.textContent = visible.length
+        ? visible.length + (visible.length === 1 ? " payment" : " payments")
+        : "";
+      return;
+    }
+    var p = visible[active];
+    node.textContent =
+      "Row " +
+      (active + 1) +
+      " of " +
+      visible.length +
+      ": " +
+      p.status +
+      ", " +
+      formatAmount(p.amount, p.asset) +
+      ", memo " +
+      p.memo;
   }
 
   /** A table cell carrying the column name the mobile card layout shows. */
@@ -528,6 +835,32 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
       tr.setAttribute("aria-current", "true");
     }
 
+    // Keep the stored record fresh when a selected row is reloaded.
+    if (state.selected[p.id]) state.selected[p.id] = p;
+
+    var selectCell = document.createElement("td");
+    selectCell.setAttribute("data-label", "Select");
+    var box = document.createElement("input");
+    box.type = "checkbox";
+    box.className = "row-select";
+    box.setAttribute("data-id", p.id);
+    box.setAttribute("aria-label", "Select payment " + p.id);
+    box.checked = !!state.selected[p.id];
+    // Stop the row's click and Enter/Space handlers from opening the detail
+    // panel when the checkbox is toggled.
+    box.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+    });
+    box.addEventListener("keydown", function (ev) {
+      ev.stopPropagation();
+    });
+    box.addEventListener("change", function () {
+      setSelected(p, box.checked);
+      syncSelectionUi();
+    });
+    selectCell.appendChild(box);
+    tr.appendChild(selectCell);
+
     var statusCell = document.createElement("td");
     statusCell.setAttribute("data-label", "Status");
     statusCell.appendChild(el("span", pillClass(p.status), p.status));
@@ -543,12 +876,12 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     tr.appendChild(labelledCell("Payment ID", "mono", shortId(p.id)));
 
     tr.addEventListener("click", function () {
-      openDetail(p.id);
+      openDetail(p.id, tr);
     });
     tr.addEventListener("keydown", function (ev) {
       if (ev.key === "Enter" || ev.key === " ") {
         ev.preventDefault();
-        openDetail(p.id);
+        openDetail(p.id, tr);
       }
     });
 
@@ -759,7 +1092,7 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     var url = URL.createObjectURL(blob);
     var a = document.createElement("a");
     a.href = url;
-    a.download = "stellargate-payments.csv";
+    a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -818,58 +1151,12 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
 
   /* ── URL hash (filters, never credentials) ───────────────────────────── */
 
-  function applyHash() {
-    store.update(parseHash(window.location.hash));
-    syncFilterUi();
-  }
-
-  function writeHash() {
-    var hash = serializeHash(store.get());
-    /* replaceState, not assign: replace keeps the back button meaningful for
-       navigation, and the hash is written from a fixed key allow-list so a
-       filter value can never smuggle anything into the URL. */
-    window.history.replaceState(
-      null,
-      "",
-      hash ? "#" + hash : window.location.pathname
-    );
-  }
-
-  /* ── Keyboard shortcuts (#721) ───────────────────────────────────────── */
-
-  function openHelp() {
-    show($("help"), true);
-    store.update({ helpOpen: true });
-    var close = $("help-close");
-    if (close) close.focus();
-  }
-
-  function closeHelp() {
-    show($("help"), false);
-    store.update({ helpOpen: false });
-    /* Hand focus back to whatever opened the overlay, so a keyboard user is
-       not dropped at the top of the document. */
-    var opener = $("help-open");
-    if (opener && typeof opener.focus === "function") opener.focus();
-  }
-
-  function toggleHelp() {
-    if (store.get().helpOpen) closeHelp();
-    else openHelp();
-  }
-
-  /** Build the `?` overlay from SHORTCUTS so docs cannot drift from behaviour. */
-  function renderHelp() {
-    var list = $("help-list");
-    if (!list) return;
-    clear(list);
-    SHORTCUTS.forEach(function (s) {
-      var li = el("li", "help-row");
-      var key = el("kbd", null, s.hint);
-      key.setAttribute("data-shortcut", s.keys[0]);
-      li.appendChild(key);
-      li.appendChild(el("span", null, s.label));
-      list.appendChild(li);
+  function syncFilterUi() {
+    Array.prototype.forEach.call(document.querySelectorAll(".chip"), function (chip) {
+      var status = chip.getAttribute("data-status") || "";
+      var isActive = status ? state.statuses.indexOf(status) >= 0 : state.statuses.length === 0;
+      chip.className = isActive ? "chip chip-on" : "chip";
+      chip.setAttribute("aria-pressed", isActive ? "true" : "false");
     });
   }
 
@@ -1008,8 +1295,23 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
       signOut(null);
     });
 
-    $("refresh").addEventListener("click", reload);
-    $("export-csv").addEventListener("click", exportCsv);
+    $("refresh").addEventListener("click", function () {
+      loadSummary();
+      reload();
+    });
+    $("export-csv").addEventListener("click", function () {
+      exportCsv(state.loadedPayments, "stellargate-payments.csv");
+    });
+    $("export-selected").addEventListener("click", function () {
+      exportCsv(selectedPayments(), "stellargate-payments-selected.csv");
+    });
+    $("select-all").addEventListener("change", function () {
+      var on = $("select-all").checked;
+      state.loadedPayments.forEach(function (p) {
+        setSelected(p, on);
+      });
+      syncSelectionUi();
+    });
     $("page-size").addEventListener("change", function () {
       var n = Number($("page-size").value) || 25;
       store.update({ pageSize: n });
@@ -1041,6 +1343,13 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
       });
     }
 
+    /* A new page of rows invalidates both the highlighted row and the CSV
+       export, which is built from the loaded set. */
+    $("load-more").addEventListener("click", function () {
+      store.update({ activeRow: -1 });
+      loadPayments();
+    });
+
     var searchClear = $("search-clear");
     if (searchClear) {
       searchClear.addEventListener("click", function () {
@@ -1053,14 +1362,13 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
       });
     }
 
-    $("load-more").addEventListener("click", loadPayments);
     $("detail-close").addEventListener("click", closeDetail);
     $("scrim").addEventListener("click", closeDetail);
     $("help-close").addEventListener("click", closeHelp);
-    /* The overlay is its own backdrop, so a click landing on the overlay rather
-       than the panel is a click outside it. There is deliberately no separate
-       scrim: a second, lower layer would sit behind the overlay permanently and
-       never receive the click. */
+    /* The overlay element is its own full-viewport backdrop, so a click that
+       lands on the overlay rather than the panel is a click outside it. There is
+       no separate scrim: a second, lower-z layer would sit permanently behind
+       the overlay and never receive the click. */
     $("help").addEventListener("click", function (ev) {
       if (ev.target === $("help")) closeHelp();
     });

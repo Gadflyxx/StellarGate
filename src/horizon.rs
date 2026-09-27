@@ -268,13 +268,32 @@ impl HorizonPayment {
     /// The operation's index within its transaction, used as the operation
     /// component of the `processed_transactions` dedup key (issue #613).
     ///
-    /// Read from the `operation_index` field rather than parsed out of the
-    /// paging token. The token *encodes* the index, but it is an opaque string
-    /// — not a plain integer — so parsing it yields `None` for real Horizon
-    /// responses and silently collapsed every operation of a transaction onto
-    /// `0`. `operation_index` is the field Horizon actually documents for this.
+    /// If the paging token is absent (e.g. a synthetic record constructed in
+    /// tests without one) we default to `0`, which is the correct value for
+    /// any single-operation transaction and for records written before this
+    /// field existed (issue #616).
+    ///
+    /// The field Horizon sends directly wins when it is present. Reading only
+    /// the paging token — as this did — makes the whole multi-op fix depend on
+    /// a token that has to happen to parse as an integer: a record whose token
+    /// is not numeric falls back to `0`, so every operation in that transaction
+    /// collapses onto one `processed_transactions` row, the second is discarded
+    /// as already-seen, and the intent stays underpaid. That is the exact bug
+    /// #613 reported, still reachable through a perfectly ordinary response.
+    ///
+    /// `0` is indistinguishable from "field absent" once `#[serde(default)]` has
+    /// run, so a zero falls through to the token: for a real single-operation
+    /// payment the token encodes the correct index anyway, and it keeps records
+    /// written before this field existed addressed by the value they were
+    /// already using.
     pub fn operation_index(&self) -> i64 {
-        self.operation_index
+        if self.operation_index != 0 {
+            return self.operation_index;
+        }
+        self.paging_token
+            .as_deref()
+            .and_then(|t| t.parse::<i64>().ok())
+            .unwrap_or(0)
     }
 }
 
