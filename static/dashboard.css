@@ -948,3 +948,99 @@ kbd {
     padding: 0.65rem 0.9rem;
   }
 }
+
+/* ── Create payment dialog (#758 / #760 / #761 / #763) ─────────────────── */
+
+.create-dialog {
+  position: fixed;
+  inset: 50% auto auto 50%;
+  transform: translate(-50%, -50%);
+  margin: 0;
+  width: min(480px, calc(100% - 2rem));
+  max-height: calc(100vh - 2rem);
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.5rem;
+  overflow-y: auto;
+  z-index: 6;
+}
+
+.create-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.create-dialog:focus,
+.create-dialog:focus-visible {
+  outline: none;
+}
+
+.field-label {
+  display: block;
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-top: 0.75rem;
+  margin-bottom: 0.25rem;
+}
+
+.form-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 1rem;
+  flex-wrap: wrap;
+}
+
+/* ── Copy buttons (#698 / #761) ──────────────────────────────────────── */
+
+.copy-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.fields .copy {
+  padding: 0.15rem 0.45rem;
+  font-size: 0.75rem;
+  flex: none;
+}
+
+/* ── QR code (#763) ──────────────────────────────────────────────────── */
+
+.instr-qr-section {
+  margin-top: 1.25rem;
+  text-align: center;
+}
+
+.qr-container {
+  display: inline-block;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.5rem;
+  background: #fff; /* QR codes require a white background for reliable scanning */
+  line-height: 0;
+}
+
+.qr-container svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+.qr-uri-details {
+  margin-top: 0.6rem;
+  text-align: left;
+}
+
+.qr-uri-details summary {
+  cursor: pointer;
+  user-select: none;
+}
+
+.qr-uri-text {
+  display: block;
+  margin-top: 0.4rem;
+  word-break: break-all;
+  font-size: 0.78rem;
+}
