@@ -177,6 +177,29 @@
             <tbody id="rows"></tbody>
           </table>
           <p id="empty" class="empty" hidden>No payments match this filter.</p>
-  
+        </section>
 
-/* … truncated 3873 chars — edit only what you need near the top … */
+        <nav id="pagination" class="pagination" aria-label="Pagination" hidden>
+          <button id="prev" class="ghost">Previous</button>
+          <span id="page-info" class="muted small"></span>
+          <button id="next" class="ghost">Next</button>
+        </nav>
+      </main>
+    </div>
+
+    <!-- Shortcuts dialog. -->
+    <dialog id="help" class="help">
+      <h2>Keyboard shortcuts</h2>
+      <ul>
+        <li><kbd>/</kbd> focus search</li>
+        <li><kbd>r</kbd> refresh</li>
+        <li><kbd>e</kbd> export CSV</li>
+        <li><kbd>?</kbd> toggle this dialog</li>
+        <li><kbd>Esc</kbd> close</li>
+      </ul>
+      <button id="help-close" class="primary">Close</button>
+    </dialog>
+
+    <script type="module" src="/dashboard/dashboard.js"></script>
+  </body>
+</html>
