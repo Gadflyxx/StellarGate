@@ -158,6 +158,35 @@ export function createSessionStore(opts) {
     return { length: key.length, prefix: key.slice(0, 8) };
   }
 
+  /**
+   * Sign the operator out because the server rejected the stored key.
+   *
+   * This is the single place a 401 is turned into a sign-out (issue #682): the
+   * key is dropped from both storage areas and a `stellargate:unauthorized`
+   * event is dispatched so the sign-in gate can re-render with a clear message.
+   * The event carries no key material — only the reason — so it is safe to log
+   * or forward. Returns true when a key was actually present and cleared, so a
+   * caller can avoid re-showing the gate for an already-signed-out session.
+   *
+   * @param {string} [reason] Short, non-secret explanation for the gate.
+   */
+  function signOut(reason) {
+    var had = has();
+    clear();
+    if (typeof window !== "undefined" && typeof window.dispatchEvent === "function") {
+      try {
+        window.dispatchEvent(
+          new CustomEvent("stellargate:unauthorized", {
+            detail: { reason: reason || "Your API key was rejected. Please sign in again." },
+          })
+        );
+      } catch (e) {
+        /* CustomEvent unavailable; the gate still re-renders on next read(). */
+      }
+    }
+    return had;
+  }
+
   return {
     read: read,
     write: write,
@@ -166,5 +195,6 @@ export function createSessionStore(opts) {
     expiresAt: expiresAt,
     has: has,
     describe: describe,
+    signOut: signOut,
   };
 }
