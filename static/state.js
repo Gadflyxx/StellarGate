@@ -13,6 +13,7 @@
  * bar, which keeps this testable and keeps the "write to history" side effect
  * in one obvious place in the controller.
  */
+// @ts-check
 
 /* Sibling modules are imported with relative specifiers, not `/dashboard/...`.
  * That is deliberate: an absolute path resolves in the browser but not under
@@ -20,6 +21,52 @@
  * The file names match the routes they are served on, so `./format.js` is
  * `/dashboard/format.js` once the page loads. */
 import { filterPayments } from "./format.js";
+
+/**
+ * A payment as returned by `GET /payments` (see `openapi.yaml`).
+ *
+ * @typedef {object} Payment
+ * @property {string} id
+ * @property {number} amount
+ * @property {string} currency
+ * @property {string} status
+ * @property {string} created_at
+ * @property {string} [description]
+ * @property {string} [customer_email]
+ */
+
+/**
+ * A webhook delivery as returned by `GET /webhooks/deliveries`
+ * (see `openapi.yaml`).
+ *
+ * @typedef {object} WebhookDelivery
+ * @property {string} id
+ * @property {string} event
+ * @property {string} status
+ * @property {number} attempts
+ * @property {string} created_at
+ * @property {string} [response_status]
+ */
+
+/**
+ * The dashboard's view state.
+ *
+ * @typedef {object} DashboardState
+ * @property {string|null} key
+ * @property {string} status
+ * @property {string} search
+ * @property {number} pageSize
+ * @property {string} createdAfter
+ * @property {string} createdBefore
+ * @property {boolean} autoRefresh
+ * @property {string|null} cursor
+ * @property {boolean} loading
+ * @property {Payment[]} loadedPayments
+ * @property {string|null} selectedPaymentId
+ * @property {number} activeRow
+ * @property {boolean} helpOpen
+ */
+
 /** State a freshly loaded page starts from. */
 export function initialState() {
   return {
@@ -48,9 +95,12 @@ export function initialState() {
  * `subscribe` is called after every successful mutation with the full next
  * state and the set of keys that changed, so a subscriber can skip work it does
  * not care about without diffing the object itself.
+ *
+ * @param {Partial<DashboardState>} [seed]
  */
 export function createStore(seed) {
   var state = Object.assign(initialState(), seed || {});
+  /** @type {Array<(state: DashboardState, changed: string[]) => void>} */
   var listeners = [];
 
   /** The current state. Treat as read-only; mutate through update(). */
@@ -65,6 +115,8 @@ export function createStore(seed) {
    * subscriber can distinguish "status changed" from "state was replaced". Keys
    * set to `undefined` are dropped rather than written, which keeps a partially
    * built patch from blanking out a field.
+   *
+   * @param {Partial<DashboardState>} patch
    */
   function update(patch) {
     var changed = [];
@@ -77,7 +129,11 @@ export function createStore(seed) {
     return state;
   }
 
-  /** Replace the whole state (used when the hash is re-read on navigation). */
+  /**
+   * Replace the whole state (used when the hash is re-read on navigation).
+   *
+   * @param {Partial<DashboardState>} next
+   */
   function replace(next) {
     var changed = [];
     Object.keys(next || {}).forEach(function (key) {
@@ -93,6 +149,8 @@ export function createStore(seed) {
    * be torn down without leaking a listener — the dashboard's single-page nature
    * means nothing is ever torn down today, but a store that cannot be
    * unsubscribed is impossible to reuse.
+   *
+   * @param {(state: DashboardState, changed: string[]) => void} fn
    */
   function subscribe(fn) {
     listeners.push(fn);
@@ -102,6 +160,7 @@ export function createStore(seed) {
     };
   }
 
+  /** @param {string[]} changed */
   function emit(changed) {
     // Iterate a copy: a subscriber that unsubscribes during notification must
     // not shift the list under the loop.
@@ -213,6 +272,8 @@ const HASH_KEYS = ["status", "search", "auto_refresh"];
  * Only the keys in HASH_KEYS are honoured. An unrecognised key is ignored
  * rather than copied into state, so a hand-edited URL cannot set an arbitrary
  * field.
+ *
+ * @param {string} hash
  */
 export function parseHash(hash) {
   var out = { status: "", search: "", autoRefresh: false };
@@ -240,6 +301,8 @@ export function parseHash(hash) {
  * Serialise the filter fields of a state object to a hash string, without the
  * leading "#". Returns "" when no filter is set, which the controller turns into
  * a plain `location.pathname` so the URL does not collect a bare "#".
+ *
+ * @param {Partial<DashboardState>} state
  */
 export function serializeHash(state) {
   var s = state || {};
