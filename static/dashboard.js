@@ -245,7 +245,7 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     var key = store.get().key;
     if (key) headers.Authorization = "Bearer " + key;
 
-    return fetch(API_BASE + path, { method: opts.method || "GET", headers: headers, body: opts.body || null }).then(
+    return fetch(API_BASE + path, { method: opts.method || "GET", headers: headers, body: opts.body || undefined }).then(
       function (res) {
         if (res.status === 401) {
           signOut("That API key was rejected. Please sign in again.");
