@@ -159,6 +159,11 @@
           </button>
         </section>
 
+        <!-- Rate-limit notice. Shown when the API answers 429 so the user is
+             told when to retry instead of a generic error. The refresh button
+             is disabled until the parsed `Retry-After` time elapses. -->
+        <p id="rate-limit" class="error" role="status" hidden></p>
+
         <section id="summary" class="summary" aria-label="Payment summary"></section>
 
         <section class="card">

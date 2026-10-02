@@ -15,6 +15,12 @@
  * CSP note: `script-src 'self'` allows this file (it is served from the same
  * origin by the gateway) and an inline script would not be, so the
  * `data-theme` attribute is set from a real file rather than a <script> block.
+ *
+ * Design tokens (issue #685): the colour and spacing custom properties live in
+ * dashboard.css on `:root`, and the dark palette is selected by the
+ * `data-theme="dark"` attribute this file sets. The attribute is therefore the
+ * single switch that flips every token, which is why the resolved theme is
+ * pinned here rather than left to `prefers-color-scheme` alone.
  */
 (function () {
   "use strict";
