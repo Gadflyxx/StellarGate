@@ -8,20 +8,61 @@
  * via el()//setText below), never innerHTML. `webhook_url`, `memo` and the
  * event name are merchant-controlled, so interpolating them as markup would
  * be a stored-XSS vector.
+ *
+ * This file is only the controller: DOM wiring and rendering. The logic worth
+ * testing is in the sibling modules it imports, all of which are DOM-free and
+ * run under `node --test` (issue #723):
+ *
+ *   format.js   pure formatting, query building, row filtering
+ *   session.js  API-key storage rules
+ *   state.js    the single view-state store and URL-hash serialisation
+ *   keys.js     which keystroke means which action (issue #721)
  */
+
+import {
+  buildListQuery,
+  countdown,
+  CSV_COLUMNS,
+  explorerTx,
+  fmtTime,
+  formatAmount,
+  pillClass,
+  relativeTime,
+  shortId,
+  toCsv,
+} from "./format.js";
+import { createSessionStore } from "./session.js";
+import { createStore, parseHash, serializeHash } from "./state.js";
+import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
 
 (function () {
   "use strict";
 
+  /* The version prefix is defined exactly once, here, so a request can never
+     end up with the prefix doubled. Pinned by `tests/dashboard_asset_tests.rs`,
+     which counts the occurrences of the prefix across this file. */
   var API_BASE = "/v1";
-  var PAGE_SIZE = 25;
   var KEY_NAME = "stellargate.apiKey";
+  var KEY_SAVED_AT = "stellargate.apiKeySavedAt";
+  var STATUSES = ["pending", "completed", "underpaid", "expired"];
 
   var state = {
     key: null,
-    status: "",
+    // Pressed status chips, in STATUSES order. Empty means "All".
+    statuses: [],
+    pageSize: 25,
+    createdAfter: "",
+    createdBefore: "",
     cursor: null,
     loading: false,
+    loadedPayments: [],
+    // Selected payments keyed by id, holding the row's payment record so the
+    // selection can be exported without re-fetching.
+    selected: {},
+    autoRefresh: false,
+    // The table row that opened the detail drawer, so focus can be handed back
+    // to it on close. See `closeDetail`.
+    detailTrigger: null,
   };
 
   // ── Tiny DOM helpers ──────────────────────────────────────────────────
@@ -39,14 +80,16 @@
   }
 
   function show(node, visible) {
-    node.hidden = !visible;
+    if (node) node.hidden = !visible;
   }
 
   function clear(node) {
+    if (!node) return;
     while (node.firstChild) node.removeChild(node.firstChild);
   }
 
   function setError(node, message) {
+    if (!node) return;
     if (message) {
       node.textContent = message;
       show(node, true);
@@ -56,17 +99,13 @@
     }
   }
 
+  /** Announce a message to screen readers via the live region. */
+  function announce(message) {
+    var live = $("live-region");
+    if (live) live.textContent = message;
+  }
+
   // ── Formatting ────────────────────────────────────────────────────────
-
-  function fmtTime(iso) {
-    if (!iso) return "—";
-    var d = new Date(iso);
-    return isNaN(d.getTime()) ? iso : d.toLocaleString();
-  }
-
-  function shortId(id) {
-    return typeof id === "string" && id.length > 12 ? id.slice(0, 8) + "…" : id;
-  }
 
   /** Map a payment or delivery status onto a pill style. */
   function pillClass(status) {
@@ -85,6 +124,128 @@
     }
   }
 
+  /** Format a payment amount with its asset code. */
+  function formatAmount(amount, asset) {
+    if (!amount) return "—";
+    return amount + " " + (asset || "XLM");
+  }
+
+  /** Return a Stellar expert explorer URL for a transaction hash. */
+  function explorerTx(hash) {
+    return "https://stellar.expert/explorer/public/tx/" + encodeURIComponent(hash);
+  }
+
+  /** Human-readable relative time (e.g. "2 min ago", "just now"). */
+  function relativeTime(iso) {
+    if (!iso) return "—";
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return iso;
+    var diffMs = Date.now() - d.getTime();
+    var diffSec = Math.round(diffMs / 1000);
+    if (diffSec < 5) return "just now";
+    if (diffSec < 60) return diffSec + "s ago";
+    var diffMin = Math.round(diffSec / 60);
+    if (diffMin < 60) return diffMin + " min ago";
+    var diffHr = Math.round(diffMin / 60);
+    if (diffHr < 24) return diffHr + "h ago";
+    return Math.round(diffHr / 24) + "d ago";
+  }
+
+  /** Human-readable countdown to an ISO timestamp (e.g. "5m 32s"). */
+  function countdown(iso) {
+    if (!iso) return "";
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return "";
+    var diffMs = d.getTime() - Date.now();
+    if (diffMs <= 0) return "expired";
+    var totalSec = Math.floor(diffMs / 1000);
+    var h = Math.floor(totalSec / 3600);
+    var m = Math.floor((totalSec % 3600) / 60);
+    var s = totalSec % 60;
+    if (h > 0) return h + "h " + m + "m";
+    if (m > 0) return m + "m " + s + "s";
+    return s + "s";
+  }
+
+  // ── Hash-state persistence ─────────────────────────────────────────────
+  // Stores the active status filter and auto-refresh flag in the URL hash so
+  // the user can bookmark or share a pre-filtered view.
+
+  function readHashState() {
+    try {
+      var hash = window.location.hash.slice(1);
+      if (!hash) return;
+      var parts = hash.split("&");
+      parts.forEach(function (part) {
+        var kv = part.split("=");
+        if (kv.length !== 2) return;
+        var key = decodeURIComponent(kv[0]);
+        var value = decodeURIComponent(kv[1]);
+        if (key === "status") {
+          state.statuses = STATUSES.filter(function (s) {
+            return value.split(",").indexOf(s) >= 0;
+          });
+        }
+        if (key === "autoRefresh") state.autoRefresh = value === "1";
+      });
+    } catch (e) {
+      /* non-fatal */
+    }
+  }
+
+  function writeHashState() {
+    try {
+      var parts = [];
+      if (state.statuses.length) {
+        parts.push("status=" + state.statuses.map(encodeURIComponent).join(","));
+      }
+      if (state.autoRefresh) parts.push("autoRefresh=1");
+      var hash = parts.length ? "#" + parts.join("&") : "";
+      window.history.replaceState(null, "", window.location.pathname + window.location.search + hash);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // ── Date range presets (#778) ──────────────────────────────────────────
+
+  /** Format a Date as a date input's YYYY-MM-DD value, in local time. */
+  function localDateValue(d) {
+    function pad(n) {
+      return (n < 10 ? "0" : "") + n;
+    }
+    return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate());
+  }
+
+  /**
+   * The start or end of a local calendar day as a UTC timestamp in the API's
+   * stored format (no milliseconds), so a day means the user's own day.
+   */
+  function localDayBound(value, endOfDay) {
+    var parts = value.split("-").map(Number);
+    var d = endOfDay
+      ? new Date(parts[0], parts[1] - 1, parts[2], 23, 59, 59)
+      : new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0);
+    return d.toISOString().replace(/\.\d{3}Z$/, "Z");
+  }
+
+  /** From/To input values covering the last `days` local days, today included. */
+  function presetRange(days) {
+    var today = new Date();
+    var from = new Date(today.getFullYear(), today.getMonth(), today.getDate() - (days - 1));
+    return { from: localDateValue(from), to: localDateValue(today) };
+  }
+
+  /** Highlight the preset whose range matches the current date inputs. */
+  function syncPresetUi() {
+    Array.prototype.forEach.call(document.querySelectorAll(".preset"), function (btn) {
+      var range = presetRange(Number(btn.getAttribute("data-days")));
+      var isActive = state.createdAfter === range.from && state.createdBefore === range.to;
+      btn.className = isActive ? "ghost preset preset-on" : "ghost preset";
+      btn.setAttribute("aria-pressed", isActive ? "true" : "false");
+    });
+  }
+
   // ── API ───────────────────────────────────────────────────────────────
 
   /**
@@ -92,12 +253,16 @@
    * carrying the API's `error` message when one is present. A 401 drops the
    * stored key and returns to the sign-in gate, since it means the key was
    * revoked or is wrong.
+   *
+   * The key is attached as an `Authorization` header and nowhere else — never a
+   * query parameter, never the fragment. #726 asserts this over every request
+   * the browser actually makes.
    */
   function api(path, options) {
     var opts = options || {};
     var headers = { Accept: "application/json" };
-    if (state.key) headers.Authorization = "Bearer " + state.key;
-    if (opts.body) headers["Content-Type"] = "application/json";
+    var key = store.get().key;
+    if (key) headers.Authorization = "Bearer " + key;
 
     return fetch(API_BASE + path, { method: opts.method || "GET", headers: headers, body: opts.body || undefined }).then(
       function (res) {
@@ -112,7 +277,9 @@
           })
           .then(function (body) {
             if (!res.ok) {
-              throw new Error(body.error || "Request failed (" + res.status + ")");
+              throw new Error(
+                body.error || "Request failed (" + res.status + ")"
+              );
             }
             return body;
           });
@@ -120,141 +287,617 @@
     );
   }
 
-  // ── Session ───────────────────────────────────────────────────────────
-
-  function storedKey() {
-    try {
-      return (
-        window.sessionStorage.getItem(KEY_NAME) ||
-        window.localStorage.getItem(KEY_NAME)
-      );
-    } catch (e) {
-      return null; // storage blocked; fall back to in-memory only
-    }
-  }
-
-  function storeKey(key, persist) {
-    try {
-      (persist ? window.localStorage : window.sessionStorage).setItem(
-        KEY_NAME,
-        key
-      );
-    } catch (e) {
-      /* non-fatal: the key still works for this page load */
-    }
-  }
-
-  function forgetKey() {
-    try {
-      window.sessionStorage.removeItem(KEY_NAME);
-      window.localStorage.removeItem(KEY_NAME);
-    } catch (e) {
-      /* nothing to do */
-    }
-  }
+  /* ── Session ─────────────────────────────────────────────────────────── */
 
   /** Return to the sign-in form, keeping any stored key so a reload retries. */
   function showGate(message) {
-    state.key = null;
+    store.update({ key: null, selectedPaymentId: null, activeRow: -1 });
     closeDetail();
     show($("app"), false);
     show($("gate"), true);
     setError($("gate-error"), message || null);
   }
 
-  /** Return to the sign-in form AND discard the stored key.
+  /**
+   * Return to the sign-in form AND discard the stored key.
    *
    * Only for cases where the key itself is the problem (a 401, or an explicit
    * sign-out). A transient failure must use showGate() instead: discarding a
    * perfectly good key because the network blinked forces the user to dig it
-   * out again. */
+   * out again.
+   */
   function signOut(message) {
-    forgetKey();
+    session.clear();
     showGate(message);
   }
 
   function signIn(key, persist) {
-    state.key = key;
+    store.update({ key: key });
+    applyHash();
     // Validate by making the cheapest authenticated call available.
     return api("/payments?limit=1").then(function () {
-      if (persist !== null) storeKey(key, persist);
+      if (persist !== null) session.write(key, persist);
       show($("gate"), false);
       show($("app"), true);
       setError($("gate-error"), null);
+      updateSessionExpiry();
       loadVersion();
       pollHealth();
+      loadSummary();
       reload();
     });
+  }
+
+  /* ── Payments list ───────────────────────────────────────────────────── */
+
+  /* Set while a request is in flight, so a refresh arriving mid-flight is
+     deferred rather than dropped. Letting two requests run concurrently would
+     let both responses append and double the list. */
+  var reloadPending = false;
+
+  function reload() {
+    store.resetPaging();
+    store.update({ loadedPayments: [] });
+    clear($("rows"));
+    clearListState();
+    loadPayments();
+  }
+
+  function loadPayments() {
+    var state = store.get();
+    if (state.loading) {
+      /* Remember the request and issue it once the current one finishes. The
+         list is already cleared by reload(), so this is a replace, not an
+         append — hence resetPaging() below too. Dropping the refresh instead
+         would leave the table the reload just cleared permanently empty. */
+      reloadPending = true;
+      return;
+    }
+    store.update({ loading: true });
+    setError($("list-error"), null);
+    announce("Loading payments");
+
+    /* Skeletons only on the first page (no cursor), so the "Load more" path
+       never inserts placeholders into an already-populated list. */
+    var isFirstPage = !state.cursor;
+    if (isFirstPage) showSkeletonRows(5);
+
+    api(buildListQuery(state))
+      .then(function (body) {
+        clearSkeletonRows();
+
+        var payments = body.payments || [];
+        var rows = store.get().loadedPayments.concat(payments);
+        store.update({ loadedPayments: rows });
+        renderRows();
+
+        /* The offset-mode response returns a cursor even on the final page, so
+           a short page is what actually signals the end. */
+        var more = payments.length === store.get().pageSize && !!body.next_cursor;
+        store.update({ cursor: more ? body.next_cursor : null });
+        show($("load-more"), more);
+
+        /* The search box narrows the loaded rows, so "nothing to show" is
+           either a filter that matched nothing or a genuinely empty account.
+           Only the latter deserves the full empty-state treatment. */
+        var visible = store.visiblePayments();
+        show($("empty"), visible.length === 0);
+        if (store.get().loadedPayments.length === 0) {
+          setListState(
+            buildEmptyState(
+              "📭",
+              "No payments found",
+              emptyMessageForFilter(store.get().status),
+              null
+            )
+          );
+        } else if (visible.length === 0) {
+          setListState(
+            buildEmptyState(
+              "🔍",
+              "No matches",
+              'Nothing matches "' +
+                store.get().search +
+                '". Clear the search box to see every loaded payment.',
+              null
+            )
+          );
+        } else {
+          clearListState();
+        }
+      })
+      .catch(function (err) {
+        clearSkeletonRows();
+        if (err.message !== "unauthorized") {
+          /* A structured state with a Retry button (#720) rather than a bare
+             error paragraph: the operator's next action is a click, not a
+             guess about what the message meant. */
+          setListState(
+            buildErrorState(err.message, function () {
+              clearListState();
+              reload();
+            })
+          );
+          setError($("list-error"), null);
+        }
+      })
+      .then(function () {
+        store.update({ loading: false });
+        if (reloadPending) {
+          reloadPending = false;
+          /* The response just applied is now stale, and its cursor points into
+             a result set the operator has already moved past, so the deferred
+             refresh starts from a clean paging state. */
+          store.resetPaging();
+          loadPayments();
+        }
+      });
+  }
+
+  function loadSummary() {
+    api("/payments/summary")
+      .then(function (body) {
+        var summary = $("summary");
+        clear(summary);
+        (body.summary || []).forEach(function (row) {
+          var card = el("div", "summary-card");
+          card.appendChild(el("span", "muted small", row[0]));
+          card.appendChild(el("strong", null, row[1]));
+          summary.appendChild(card);
+        });
+      })
+      .catch(function (err) {
+        clear($("summary"));
+        announce("Error loading summary: " + err.message);
+      });
+  }
+
+  /** Draw the currently visible rows, honouring the search box and `j`/`k`. */
+  function renderRows() {
+    var tbody = $("rows");
+    var visible = store.visiblePayments();
+    var active = store.get().activeRow;
+    clear(tbody);
+
+    visible.forEach(function (p, index) {
+      tbody.appendChild(rowFor(p, index === active));
+    });
+
+    show($("empty"), visible.length === 0);
+    announceRow(visible, active);
+  }
+
+  /**
+   * Announce the highlighted row to assistive technology.
+   *
+   * The `j`/`k` highlight is otherwise a purely visual change: a sighted user
+   * sees the row move, a screen-reader user would hear nothing at all. This
+   * runs on every render, not just on keypress, so a filter change that moves
+   * the highlight is announced too.
+   */
+  function announceRow(visible, active) {
+    var node = $("rows-status");
+    if (!node) return;
+    if (active < 0 || active >= visible.length) {
+      node.textContent = visible.length
+        ? visible.length + (visible.length === 1 ? " payment" : " payments")
+        : "";
+      return;
+    }
+    var p = visible[active];
+    node.textContent =
+      "Row " +
+      (active + 1) +
+      " of " +
+      visible.length +
+      ": " +
+      p.status +
+      ", " +
+      formatAmount(p.amount, p.asset) +
+      ", memo " +
+      p.memo;
+  }
+
+  /* ── Skeleton helpers (#719) ─────────────────────────────────────────── */
+
+  /**
+   * Append `count` skeleton placeholder rows to the payments tbody. Removed by
+   * `clearSkeletonRows()` once real data — or an error — arrives.
+   *
+   * `aria-hidden` because the row count is already announced separately: a
+   * screen reader that reads five rows of "Status Amount Memo" gains nothing
+   * and is interrupted mid-sentence by the real rows replacing them.
+   */
+  function showSkeletonRows(count) {
+    var tbody = $("rows");
+    for (var i = 0; i < count; i++) {
+      var tr = document.createElement("tr");
+      tr.className = "skeleton-row";
+      tr.setAttribute("aria-hidden", "true");
+
+      var cols = [
+        { label: "Select",     cls: "sk-select" },
+        { label: "Status",     cls: "sk-status" },
+        { label: "Amount",     cls: "sk-amount" },
+        { label: "Memo",       cls: "sk-memo" },
+        { label: "Created",    cls: "sk-date" },
+        { label: "Payment ID", cls: "sk-id" },
+      ];
+      cols.forEach(function (col) {
+        var td = document.createElement("td");
+        td.setAttribute("data-label", col.label);
+        td.appendChild(el("span", "skeleton-cell " + col.cls));
+        tr.appendChild(td);
+      });
+
+      tbody.appendChild(tr);
+    }
+  }
+
+  function clearSkeletonRows() {
+    var tbody = $("rows");
+    if (!tbody) return;
+    var skeletons = tbody.querySelectorAll(".skeleton-row");
+    for (var i = 0; i < skeletons.length; i++) {
+      tbody.removeChild(skeletons[i]);
+    }
+  }
+
+  /**
+   * Replace the detail panel fields with skeleton placeholders while the
+   * payment record loads.
+   */
+  function showDetailSkeleton() {
+    var fields = $("detail-fields");
+    clear(fields);
+
+    var rows = [
+      { dtWidth: "4rem", ddCls: "skeleton-field skeleton-field-short" },
+      { dtWidth: "4rem", ddCls: "skeleton-field skeleton-field-short" },
+      { dtWidth: "5rem", ddCls: "skeleton-field skeleton-field-long" },
+      { dtWidth: "6rem", ddCls: "skeleton-field skeleton-field-full" },
+      { dtWidth: "5rem", ddCls: "skeleton-field skeleton-field-full" },
+      { dtWidth: "6rem", ddCls: "skeleton-field skeleton-field-long" },
+      { dtWidth: "4rem", ddCls: "skeleton-field skeleton-field-short" },
+    ];
+
+    rows.forEach(function (row) {
+      var dt = document.createElement("dt");
+      var dtBlock = el("span", "skeleton-field skeleton-field-short");
+      dtBlock.style.width = row.dtWidth;
+      dtBlock.setAttribute("aria-hidden", "true");
+      dt.appendChild(dtBlock);
+      fields.appendChild(dt);
+
+      var dd = document.createElement("dd");
+      var ddBlock = el("span", row.ddCls);
+      ddBlock.setAttribute("aria-hidden", "true");
+      dd.appendChild(ddBlock);
+      fields.appendChild(dd);
+    });
+  }
+
+  /* ── Empty / error state helpers (#720) ──────────────────────────────── */
+
+  /**
+   * Build a structured empty-state node: icon, title, explanation, and an
+   * optional retry button.
+   */
+  function buildEmptyState(icon, title, message, onRetry) {
+    var wrap = el("div", "empty-state");
+    wrap.setAttribute("role", "status");
+
+    var iconEl = el("span", "empty-state-icon", icon);
+    iconEl.setAttribute("aria-hidden", "true");
+    wrap.appendChild(iconEl);
+
+    wrap.appendChild(el("span", "empty-state-title", title));
+    wrap.appendChild(el("p", "empty-state-body muted", message));
+
+    if (onRetry) {
+      var btn = el("button", "ghost", "Try again");
+      btn.type = "button";
+      btn.addEventListener("click", onRetry);
+      wrap.appendChild(btn);
+    }
+
+    return wrap;
+  }
+
+  /** Build a structured error-state node with a retry button. */
+  function buildErrorState(message, onRetry) {
+    var wrap = el("div", "error-state");
+    wrap.appendChild(el("p", "error-state-message", message));
+
+    var btn = el("button", "ghost", "Retry");
+    btn.type = "button";
+    btn.addEventListener("click", onRetry);
+    wrap.appendChild(btn);
+
+    return wrap;
+  }
+
+  /** An empty-state message tailored to the active status filter. */
+  function emptyMessageForFilter(status) {
+    switch (status) {
+      case "pending":
+        return "No pending payments. New payments will appear here once created.";
+      case "completed":
+        return "No completed payments match your current filters.";
+      case "underpaid":
+        return "No underpaid payments. Underpaid intents appear here until topped up.";
+      case "expired":
+        return "No expired payments in this date range.";
+      default:
+        return "No payments have been created yet. Create a payment intent to get started.";
+    }
   }
 
   // ── Payments list ─────────────────────────────────────────────────────
 
   function reload() {
-    state.cursor = null;
+    store.resetPaging();
+    store.update({ loadedPayments: [] });
     clear($("rows"));
-    loadPayments();
+    // Clear any previous empty/error state injected into the list area.
+    var prev = $("list-state");
+    if (prev && prev.parentNode) prev.parentNode.removeChild(prev);
   }
 
-  function loadPayments() {
-    if (state.loading) return;
-    state.loading = true;
-    setError($("list-error"), null);
+  /* Set while a request is in flight, so a refresh arriving mid-flight is
+     deferred rather than dropped. Dropping it would leave the table the reload
+     just cleared permanently empty; letting it run concurrently would let two
+     responses both append, doubling the list. */
+  var reloadPending = false;
 
-    var query = "/payments?limit=" + PAGE_SIZE;
-    if (state.status) query += "&status=" + encodeURIComponent(state.status);
+  function loadPayments() {
+    var state = store.get();
+    if (state.loading) {
+      /* Remember the request and issue it once the current one finishes. The
+         list is already cleared by reload(), so this is a replace, not an
+         append — hence resetPaging() here too. */
+      reloadPending = true;
+      return;
+    }
+    store.update({ loading: true });
+    setError($("list-error"), null);
+    announce("Loading payments");
+
+    var query = "/payments?limit=" + state.pageSize;
+    // The list API accepts a single `status`. With one chip pressed the server
+    // filters; with several, unfiltered pages are fetched and filtered below.
+    // Known limitation: a page can then hold fewer matching rows than the page
+    // size (even none) while "Load more" still has further pages to fetch.
+    if (state.statuses.length === 1) query += "&status=" + encodeURIComponent(state.statuses[0]);
+    if (state.createdAfter) query += "&created_after=" + encodeURIComponent(localDayBound(state.createdAfter, false));
+    if (state.createdBefore) query += "&created_before=" + encodeURIComponent(localDayBound(state.createdBefore, true));
     if (state.cursor) query += "&cursor=" + encodeURIComponent(state.cursor);
+
+    // Show skeleton rows only on the first page load (no cursor yet), so the
+    // "Load more" path doesn't insert skeletons into an already-populated list.
+    var isFirstPage = !state.cursor;
+    if (isFirstPage) showSkeletonRows(5);
 
     api(query)
       .then(function (body) {
+        clearSkeletonRows();
+
         var payments = body.payments || [];
-        payments.forEach(appendRow);
+        var shown = state.statuses.length > 1
+          ? payments.filter(function (p) {
+              return state.statuses.indexOf(p.status) >= 0;
+            })
+          : payments;
+        state.loadedPayments = state.loadedPayments.concat(shown);
+        shown.forEach(appendRow);
+        syncSelectionUi();
+
+        // Remove any previous inline state nodes before rendering new ones.
+        var prev = $("list-state");
+        if (prev) prev.parentNode.removeChild(prev);
 
         // The offset-mode response returns a cursor even on the final page, so
         // a short page is what actually signals the end.
-        var more = payments.length === PAGE_SIZE && !!body.next_cursor;
+        var more = payments.length === state.pageSize && !!body.next_cursor;
         state.cursor = more ? body.next_cursor : null;
         show($("load-more"), more);
-        show($("empty"), $("rows").childElementCount === 0);
+
+        // #720: show filter-tailored empty state when the list is empty.
+        if ($("rows").childElementCount === 0 && !more) {
+          var emptyNode = buildEmptyState(
+            "📭",
+            "No payments found",
+            state.statuses.length > 1
+              ? "No payments match the selected statuses."
+              : emptyMessageForFilter(state.statuses[0] || ""),
+            null
+          );
+          emptyNode.id = "list-state";
+          $("rows").parentNode.insertBefore(emptyNode, $("rows").nextSibling);
+          show($("empty"), false);
+        } else {
+          show($("empty"), false);
+        }
       })
       .catch(function (err) {
-        if (err.message !== "unauthorized") setError($("list-error"), err.message);
+        clearSkeletonRows();
+
+        // Remove any previous inline state nodes before rendering error.
+        var prev = $("list-state");
+        if (prev) prev.parentNode.removeChild(prev);
+
+        if (err.message !== "unauthorized") {
+          // #720: replace the inline error paragraph with a structured error
+          // state that includes a Retry button.
+          var errNode = buildErrorState(err.message, function () {
+            var stateNode = $("list-state");
+            if (stateNode) stateNode.parentNode.removeChild(stateNode);
+            reload();
+          });
+          errNode.id = "list-state";
+          $("rows").parentNode.insertBefore(errNode, $("rows").nextSibling);
+          setError($("list-error"), null);
+        }
       })
       .then(function () {
-        state.loading = false;
+        store.update({ loading: false });
+        if (reloadPending) {
+          reloadPending = false;
+          /* The response just applied is now stale, and its cursor points into
+             a result set the operator has already moved past, so the deferred
+             refresh starts from a clean paging state. */
+          store.resetPaging();
+          loadPayments();
+        }
       });
   }
 
-  function appendRow(p) {
+  function loadSummary() {
+    api("/payments/summary")
+      .then(function (body) {
+        var summary = $("summary");
+        clear(summary);
+        (body.summary || []).forEach(function (row) {
+          var card = el("div", "summary-card");
+          card.appendChild(el("span", "muted small", row[0]));
+          card.appendChild(el("strong", null, row[1]));
+          summary.appendChild(card);
+        });
+        renderChipCounts(body.summary || []);
+      })
+      .catch(function (err) {
+        clear($("summary"));
+        announce("Error loading summary: " + err.message);
+      });
+  }
+
+  /** Draw the currently visible rows, honouring the search box and `j`/`k`. */
+  function renderRows() {
+    var tbody = $("rows");
+    var visible = store.visiblePayments();
+    var active = store.get().activeRow;
+    clear(tbody);
+
+    visible.forEach(function (p, index) {
+      tbody.appendChild(rowFor(p, index === active));
+    });
+
+    show($("empty"), visible.length === 0);
+    announceRow(visible, active);
+  }
+
+  /**
+   * Announce the highlighted row to assistive technology.
+   *
+   * The `j`/`k` highlight is otherwise a purely visual change: a sighted user
+   * sees the row move, a screen-reader user would hear nothing at all. This
+   * runs on every render, not just on keypress, so a filter change that moves
+   * the highlight is announced too.
+   */
+  function announceRow(visible, active) {
+    var node = $("rows-status");
+    if (!node) return;
+    if (active < 0 || active >= visible.length) {
+      node.textContent = visible.length
+        ? visible.length + (visible.length === 1 ? " payment" : " payments")
+        : "";
+      return;
+    }
+    var p = visible[active];
+    node.textContent =
+      "Row " +
+      (active + 1) +
+      " of " +
+      visible.length +
+      ": " +
+      p.status +
+      ", " +
+      formatAmount(p.amount, p.asset) +
+      ", memo " +
+      p.memo;
+  }
+
+  /** A table cell carrying the column name the mobile card layout shows. */
+  function labelledCell(label, className, text) {
+    var td = el("td", className, text);
+    td.setAttribute("data-label", label);
+    return td;
+  }
+
+  function rowFor(p, isActive) {
     var tr = document.createElement("tr");
     tr.tabIndex = 0;
+    tr.dataset.paymentId = p.id;
+    if (isActive) {
+      tr.className = "row-active";
+      /* Roving tabindex: the highlighted row is the one the keyboard lands on,
+         so tabbing into the table does not restart at row 1. */
+      tr.setAttribute("aria-current", "true");
+    }
+
+    // Keep the stored record fresh when a selected row is reloaded.
+    if (state.selected[p.id]) state.selected[p.id] = p;
+
+    var selectCell = document.createElement("td");
+    selectCell.setAttribute("data-label", "Select");
+    var box = document.createElement("input");
+    box.type = "checkbox";
+    box.className = "row-select";
+    box.setAttribute("data-id", p.id);
+    box.setAttribute("aria-label", "Select payment " + p.id);
+    box.checked = !!state.selected[p.id];
+    // Stop the row's click and Enter/Space handlers from opening the detail
+    // panel when the checkbox is toggled.
+    box.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+    });
+    box.addEventListener("keydown", function (ev) {
+      ev.stopPropagation();
+    });
+    box.addEventListener("change", function () {
+      setSelected(p, box.checked);
+      syncSelectionUi();
+    });
+    selectCell.appendChild(box);
+    tr.appendChild(selectCell);
 
     var statusCell = document.createElement("td");
+    statusCell.setAttribute("data-label", "Status");
     statusCell.appendChild(el("span", pillClass(p.status), p.status));
     tr.appendChild(statusCell);
 
-    tr.appendChild(el("td", null, p.amount + " " + p.asset));
-    tr.appendChild(el("td", "mono", p.memo));
-    tr.appendChild(el("td", null, fmtTime(p.created_at)));
-    tr.appendChild(el("td", "mono", shortId(p.id)));
+    /* `data-label` is what the ≤720px card layout renders as each row's
+       heading (see `.payments td::before` in dashboard.css). The table header
+       cells are hidden at that width, so without it the cards degrade to an
+       unlabelled list of values. */
+    tr.appendChild(labelledCell("Amount", null, formatAmount(p.amount, p.asset)));
+    tr.appendChild(labelledCell("Memo", "mono", p.memo));
+    tr.appendChild(labelledCell("Created", null, fmtTime(p.created_at)));
+    tr.appendChild(labelledCell("Payment ID", "mono", shortId(p.id)));
 
     tr.addEventListener("click", function () {
-      openDetail(p.id);
+      openDetail(p.id, tr);
     });
     tr.addEventListener("keydown", function (ev) {
       if (ev.key === "Enter" || ev.key === " ") {
         ev.preventDefault();
-        openDetail(p.id);
+        openDetail(p.id, tr);
       }
     });
 
-    $("rows").appendChild(tr);
+    return tr;
   }
 
-  // ── Detail panel ──────────────────────────────────────────────────────
+  /* ── Detail panel ────────────────────────────────────────────────────── */
 
   function openDetail(id) {
+    store.update({ selectedPaymentId: id });
     show($("detail"), true);
     show($("scrim"), true);
+    /* Move focus into the panel so the keyboard user is inside the thing that
+       just opened, and so Escape is meaningful without a pointer. */
+    var close = $("detail-close");
+    if (close) close.focus();
 
     var fields = $("detail-fields");
     clear(fields);
@@ -262,38 +905,80 @@
     setError($("deliveries-error"), null);
     show($("deliveries-empty"), false);
 
+    // #719: show skeleton placeholders while the payment record loads.
+    showDetailSkeleton();
+
     api("/payments/" + encodeURIComponent(id))
       .then(function (p) {
+        clear(fields);
         [
           ["Status", p.status],
-          ["Amount", p.amount + " " + p.asset],
-          ["Received", p.paid_amount ? p.paid_amount + " " + p.asset : "—"],
+          ["Amount", formatAmount(p.amount, p.asset)],
+          [
+            "Received",
+            p.paid_amount ? formatAmount(p.paid_amount, p.asset) : "—",
+          ],
           ["Memo", p.memo],
           ["Destination", p.destination_address],
           ["Transaction", p.tx_hash || "—"],
+          ["Network", "Stellar"],
+          ["Asset issuer", p.asset_issuer || "native"],
           ["Payment ID", p.id],
           ["Merchant", p.merchant_id],
           ["Created", fmtTime(p.created_at)],
           ["Updated", fmtTime(p.updated_at)],
-          ["Expires", fmtTime(p.expires_at)],
+          [
+            "Expires",
+            fmtTime(p.expires_at) +
+              (p.status === "pending"
+                ? " (" + countdown(p.expires_at) + " left)"
+                : ""),
+          ],
         ].forEach(function (pair) {
           fields.appendChild(el("dt", null, pair[0]));
           if (pair[0] === "Status") {
             var dd = document.createElement("dd");
             dd.appendChild(el("span", pillClass(p.status), p.status));
             fields.appendChild(dd);
+          } else if (pair[0] === "Transaction" && p.tx_hash) {
+            var tx = document.createElement("dd");
+            var link = el("a", "mono", shortId(p.tx_hash));
+            link.href = explorerTx(p.tx_hash);
+            link.target = "_blank";
+            link.rel = "noopener noreferrer";
+            tx.appendChild(link);
+            fields.appendChild(tx);
           } else {
             fields.appendChild(el("dd", "mono", pair[1]));
           }
         });
       })
       .catch(function (err) {
+        clear(fields);
         if (err.message !== "unauthorized") {
-          fields.appendChild(el("dd", "error", err.message));
+          // #720: show a structured error state with a retry button in the
+          // detail panel instead of a bare error text node.
+          var errNode = buildErrorState(err.message, function () {
+            openDetail(id);
+          });
+          var wrapper = document.createElement("dd");
+          wrapper.appendChild(errNode);
+          fields.appendChild(el("dt", null, "Error"));
+          fields.appendChild(wrapper);
         }
       });
 
     loadDeliveries(id);
+  }
+
+  function closeDetail() {
+    store.update({ selectedPaymentId: null });
+    show($("detail"), false);
+    show($("scrim"), false);
+    /* Return focus to the list so a keyboard user is not dropped at the top of
+       the document after dismissing the panel. */
+    var rows = document.querySelector("#rows tr");
+    if (rows && typeof rows.focus === "function") rows.focus();
   }
 
   function loadDeliveries(paymentId) {
@@ -302,14 +987,28 @@
         var list = $("deliveries");
         clear(list);
         var deliveries = body.deliveries || [];
-        show($("deliveries-empty"), deliveries.length === 0);
-        deliveries.forEach(function (d) {
-          list.appendChild(deliveryItem(paymentId, d));
-        });
+        if (deliveries.length === 0) {
+          // #720: tailored empty message for deliveries.
+          show($("deliveries-empty"), true);
+        } else {
+          show($("deliveries-empty"), false);
+          deliveries.forEach(function (d) {
+            list.appendChild(deliveryItem(paymentId, d));
+          });
+        }
       })
       .catch(function (err) {
         if (err.message !== "unauthorized") {
-          setError($("deliveries-error"), err.message);
+          // #720: deliveries error with a retry button.
+          var errNode = buildErrorState(err.message, function () {
+            setError($("deliveries-error"), null);
+            loadDeliveries(paymentId);
+          });
+          var container = $("deliveries-error").parentNode;
+          // Reuse the existing deliveries-error node as an anchor for the
+          // error state so we don't multiply error nodes on repeated retries.
+          setError($("deliveries-error"), null);
+          container.insertBefore(errNode, $("deliveries-error"));
         }
       });
   }
@@ -327,12 +1026,35 @@
       el(
         "div",
         "delivery-meta",
-        "attempt " + d.attempts + " · last " + fmtTime(d.last_attempt)
+        "attempt " + d.attempts + " · manual " + (d.manual_attempts || 0)
       )
     );
+    li.appendChild(el("div", "delivery-meta", "last: " + relativeTime(d.last_attempt)));
+    li.lastChild.title = fmtTime(d.last_attempt);
+    li.appendChild(el("div", "delivery-meta", "created: " + relativeTime(d.created_at)));
+    li.lastChild.title = fmtTime(d.created_at);
+    if (d.status === "failed") {
+      li.appendChild(
+        el(
+          "div",
+          "error",
+          "Last delivery failed; check receiver logs or redeliver."
+        )
+      );
+    }
+    if (d.status !== "delivered") {
+      li.appendChild(
+        el(
+          "div",
+          "delivery-meta",
+          "retry state: queued for redrive if attempts remain"
+        )
+      );
+    }
 
     var button = el("button", "ghost", "Redeliver");
     button.addEventListener("click", function () {
+      if (!window.confirm("Redeliver this webhook now?")) return;
       button.disabled = true;
       button.textContent = "Sending…";
       api(
@@ -350,7 +1072,12 @@
           button.disabled = false;
           button.textContent = "Redeliver";
           if (err.message !== "unauthorized") {
-            setError($("deliveries-error"), err.message);
+            setError(
+              $("deliveries-error"),
+              err.message.indexOf("429") >= 0
+                ? "Rate limited. Try again shortly."
+                : err.message
+            );
           }
         });
     });
@@ -359,12 +1086,18 @@
     return li;
   }
 
-  function closeDetail() {
-    show($("detail"), false);
-    show($("scrim"), false);
+  function exportCsv() {
+    var csv = toCsv(store.get().loadedPayments, CSV_COLUMNS);
+    var blob = new Blob([csv], { type: "text/csv" });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
   }
 
-  // ── Version ───────────────────────────────────────────────────────────
+  /* ── Version ─────────────────────────────────────────────────────────── */
 
   /** The root route answers with "StellarGate API vX.Y.Z". */
   function loadVersion() {
@@ -381,7 +1114,19 @@
       });
   }
 
-  // ── Health ────────────────────────────────────────────────────────────
+  /* ── Health ──────────────────────────────────────────────────────────── */
+
+  function updateSessionExpiry() {
+    var expiresAt = session.expiresAt();
+    var node = $("session-expiry");
+    if (!node) return;
+    if (expiresAt === null) {
+      node.textContent = "";
+      return;
+    }
+    node.textContent = "session " + countdown(new Date(expiresAt).toISOString());
+    node.title = "Saved " + fmtTime(new Date(session.savedAt()).toISOString());
+  }
 
   function pollHealth() {
     fetch("/ready", { headers: { Accept: "application/json" } })
@@ -394,150 +1139,155 @@
         var pill = $("health");
         pill.className = r.ok ? "pill pill-ok" : "pill pill-err";
         pill.textContent = r.ok ? "healthy" : r.body.reason || "unavailable";
+        pill.title = JSON.stringify(r.body);
       })
       .catch(function () {
         var pill = $("health");
         pill.className = "pill pill-err";
         pill.textContent = "unreachable";
+        pill.title = "Readiness request failed";
       });
   }
 
-  // ── New-payment dialog (#758 / #759) ─────────────────────────────────
+  /* ── URL hash (filters, never credentials) ───────────────────────────── */
 
-  /** Validate amount: positive, ≤7 decimals, no exponent notation. */
-  function validateAmount(val) {
-    if (!val) return "Amount is required.";
-    if (/[eE]/.test(val)) return "Exponent notation is not allowed.";
-    if (!/^\d+(\.\d+)?$/.test(val)) return "Enter a positive number.";
-    var parts = val.split(".");
-    if (parts[1] && parts[1].length > 7) return "At most 7 decimal places allowed.";
-    if (parseFloat(val) <= 0) return "Amount must be greater than zero.";
-    return null;
+  function syncFilterUi() {
+    Array.prototype.forEach.call(document.querySelectorAll(".chip"), function (chip) {
+      var status = chip.getAttribute("data-status") || "";
+      var isActive = status ? state.statuses.indexOf(status) >= 0 : state.statuses.length === 0;
+      chip.className = isActive ? "chip chip-on" : "chip";
+      chip.setAttribute("aria-pressed", isActive ? "true" : "false");
+    });
   }
 
-  /** Validate webhook_url: must be absent or an absolute https:// URL. */
-  function validateWebhook(val) {
-    if (!val) return null; // optional
-    if (!/^https:\/\/.+/i.test(val)) return "Webhook URL must start with https://.";
-    try {
-      var u = new URL(val);
-      if (u.protocol !== "https:") return "Webhook URL must use https://.";
-    } catch (e) {
-      return "Enter a valid absolute URL.";
-    }
-    return null;
-  }
-
-  function setFieldError(inputEl, errEl, message) {
-    if (message) {
-      inputEl.setAttribute("aria-invalid", "true");
-      errEl.textContent = message;
-      show(errEl, true);
-    } else {
-      inputEl.removeAttribute("aria-invalid");
-      errEl.textContent = "";
-      show(errEl, false);
+  function moveActiveRow(delta) {
+    var count = store.visiblePayments().length;
+    store.update({ activeRow: moveRow(store.get().activeRow, count, delta) });
+    renderRows();
+    var active = document.querySelector("#rows tr.row-active");
+    if (active && typeof active.scrollIntoView === "function") {
+      active.scrollIntoView({ block: "nearest" });
     }
   }
 
-  function resetDialog() {
-    $("payment-form").reset();
-    setFieldError($("p-amount"), $("p-amount-err"), null);
-    setFieldError($("p-asset"), $("p-asset-err"), null);
-    setFieldError($("p-webhook"), $("p-webhook-err"), null);
-    setError($("p-form-err"), null);
-    $("dialog-submit").disabled = false;
-    $("dialog-submit").textContent = "Create";
+  /** Open the highlighted row, or do nothing when no row is highlighted. */
+  function openActiveRow() {
+    var state = store.get();
+    var visible = store.visiblePayments();
+    if (state.activeRow < 0 || state.activeRow >= visible.length) return;
+    openDetail(visible[state.activeRow].id);
   }
 
-  function openPaymentDialog() {
-    resetDialog();
-    $("payment-dialog").showModal();
-    $("p-amount").focus();
-  }
-
-  function closePaymentDialog() {
-    $("payment-dialog").close();
-  }
-
-  /** Map a 400 API error code to the right field error element pair. */
-  var FIELD_ERROR_MAP = {
-    invalid_amount:       { input: "p-amount",  err: "p-amount-err"  },
-    amount_out_of_range:  { input: "p-amount",  err: "p-amount-err"  },
-    invalid_asset:        { input: "p-asset",   err: "p-asset-err"   },
-    invalid_webhook_url:  { input: "p-webhook", err: "p-webhook-err" },
-  };
-
-  function submitPayment(ev) {
-    ev.preventDefault();
-
-    var amountVal  = $("p-amount").value.trim();
-    var assetVal   = $("p-asset").value.trim();
-    var webhookVal = $("p-webhook").value.trim();
-
-    // Client-side validation (#759)
-    var amountErr  = validateAmount(amountVal);
-    var assetErr   = assetVal ? null : "Asset is required.";
-    var webhookErr = validateWebhook(webhookVal);
-
-    setFieldError($("p-amount"),  $("p-amount-err"),  amountErr);
-    setFieldError($("p-asset"),   $("p-asset-err"),   assetErr);
-    setFieldError($("p-webhook"), $("p-webhook-err"), webhookErr);
-
-    if (amountErr || assetErr || webhookErr) {
-      // Focus the first invalid field
-      if (amountErr)       { $("p-amount").focus(); }
-      else if (assetErr)   { $("p-asset").focus(); }
-      else                 { $("p-webhook").focus(); }
+  function onKeydown(ev) {
+    /* The help overlay is modal over the app: only its own dismiss keys are
+       honoured while it is open, so a stray `j` cannot move rows behind it. */
+    if (store.get().helpOpen) {
+      if (ev.key === "Escape" || ev.key === "?") {
+        ev.preventDefault();
+        closeHelp();
+      }
       return;
     }
 
-    $("dialog-submit").disabled = true;
-    $("dialog-submit").textContent = "Creating…";
-    setError($("p-form-err"), null);
+    var action = matchShortcut(ev, { activeElement: document.activeElement });
+    if (!action) return;
 
-    var body = { amount: amountVal, asset: assetVal };
-    if (webhookVal) body.webhook_url = webhookVal;
+    if (action === "focusSearch") {
+      var search = $("search");
+      if (!search) return;
+      ev.preventDefault();
+      search.focus();
+      search.select();
+      return;
+    }
 
-    // Use the versioned api() helper so all requests stay under API_BASE (#758)
-    api("/payments", { method: "POST", body: JSON.stringify(body) })
-      .then(function (payment) {
-        closePaymentDialog();
-        // Insert the new payment at the top of the list (#758)
-        var firstRow = $("rows").firstChild;
-        appendRow(payment);
-        var appended = $("rows").lastChild;
-        $("rows").insertBefore(appended, firstRow || null);
-        show($("empty"), false);
-      })
-      .catch(function (err) {
-        if (err.message !== "unauthorized") {
-          // Try to map structured error codes onto fields (#759)
-          // api() rejects with the body.error string; re-check the response
-          // by parsing it from the message when it matches a known code.
-          var mapped = FIELD_ERROR_MAP[err.message];
-          if (mapped) {
-            setFieldError($(mapped.input), $(mapped.err), err.message);
-            $(mapped.input).focus();
-          } else {
-            setError($("p-form-err"), err.message);
-          }
-        }
-        $("dialog-submit").disabled = false;
-        $("dialog-submit").textContent = "Create";
-      });
+    /* Everything below is an in-app action and must not also reach the
+       browser's own defaults (space scrolls, `?` opens quick find in some
+       browsers, `/` opens quick find in Firefox). */
+    ev.preventDefault();
+
+    switch (action) {
+      case "refresh":
+        reload();
+        break;
+      case "nextRow":
+        moveActiveRow(1);
+        break;
+      case "prevRow":
+        moveActiveRow(-1);
+        break;
+      case "closeDrawer":
+        closeDetail();
+        break;
+      case "toggleHelp":
+        toggleHelp();
+        break;
+      default:
+        break;
+    }
   }
 
-  // ── Wiring ────────────────────────────────────────────────────────────
+  /* ── Wiring ──────────────────────────────────────────────────────────── */
+
+  function syncFilterUi() {
+    var state = store.get();
+    Array.prototype.forEach.call(
+      document.querySelectorAll(".chip"),
+      function (chip) {
+        chip.className =
+          (chip.getAttribute("data-status") || "") === state.status
+            ? "chip chip-on"
+            : "chip";
+      }
+    );
+
+    var search = $("search");
+    if (search && search.value !== state.search) search.value = state.search;
+
+    var size = $("page-size");
+    if (size) size.value = String(state.pageSize);
+
+    var after = $("created-after");
+    if (after && after.value !== state.createdAfter) after.value = state.createdAfter;
+
+    var before = $("created-before");
+    if (before && before.value !== state.createdBefore) before.value = state.createdBefore;
+
+    var auto = $("auto-refresh");
+    if (auto) auto.checked = state.autoRefresh;
+  }
+
+  /** Re-render on a filter change: rows, chips, and the URL hash together. */
+  function onFilterChange() {
+    syncFilterUi();
+    writeHash();
+    reload();
+  }
+
+  /**
+   * Show the clear button only when there is something to clear.
+   *
+   * `type="search"` gives some browsers a native clear affordance, but not all,
+   * and it is invisible to keyboard users when it is not rendered — an explicit
+   * button keeps "get rid of this filter" reachable everywhere.
+   */
+  function syncSearchClear() {
+    var button = $("search-clear");
+    if (button) button.hidden = !store.get().search;
+  }
 
   function init() {
+    renderHelp();
+
     $("gate-form").addEventListener("submit", function (ev) {
       ev.preventDefault();
       var key = $("api-key").value.trim();
       if (!key) return;
       setError($("gate-error"), null);
       signIn(key, $("remember").checked).catch(function (err) {
-        if (err.message !== "unauthorized") setError($("gate-error"), err.message);
+        if (err.message !== "unauthorized") {
+          setError($("gate-error"), err.message);
+        }
       });
     });
 
@@ -545,51 +1295,133 @@
       signOut(null);
     });
 
-    $("refresh").addEventListener("click", reload);
-    $("load-more").addEventListener("click", loadPayments);
+    $("refresh").addEventListener("click", function () {
+      loadSummary();
+      reload();
+    });
+    $("export-csv").addEventListener("click", function () {
+      exportCsv(state.loadedPayments, "stellargate-payments.csv");
+    });
+    $("export-selected").addEventListener("click", function () {
+      exportCsv(selectedPayments(), "stellargate-payments-selected.csv");
+    });
+    $("select-all").addEventListener("change", function () {
+      var on = $("select-all").checked;
+      state.loadedPayments.forEach(function (p) {
+        setSelected(p, on);
+      });
+      syncSelectionUi();
+    });
+    $("page-size").addEventListener("change", function () {
+      var n = Number($("page-size").value) || 25;
+      store.update({ pageSize: n });
+      onFilterChange();
+    });
+    $("created-after").addEventListener("change", function () {
+      store.update({ createdAfter: $("created-after").value });
+      onFilterChange();
+    });
+    $("created-before").addEventListener("change", function () {
+      store.update({ createdBefore: $("created-before").value });
+      onFilterChange();
+    });
+    $("auto-refresh").addEventListener("change", function () {
+      store.update({ autoRefresh: $("auto-refresh").checked });
+      onFilterChange();
+    });
+
+    /* Search filters the rows already loaded (#693), so it filters on input
+       with no debounce needed: there is no request to batch. */
+    var search = $("search");
+    if (search) {
+      search.addEventListener("input", function () {
+        store.update({ search: search.value.trim() });
+        store.clampActiveRow();
+        renderRows();
+        writeHash();
+        syncSearchClear();
+      });
+    }
+
+    /* A new page of rows invalidates both the highlighted row and the CSV
+       export, which is built from the loaded set. */
+    $("load-more").addEventListener("click", function () {
+      store.update({ activeRow: -1 });
+      loadPayments();
+    });
+
+    var searchClear = $("search-clear");
+    if (searchClear) {
+      searchClear.addEventListener("click", function () {
+        store.update({ search: "" });
+        renderRows();
+        writeHash();
+        syncSearchClear();
+        var box = $("search");
+        if (box) box.focus();
+      });
+    }
+
     $("detail-close").addEventListener("click", closeDetail);
     $("scrim").addEventListener("click", closeDetail);
-
-    // New-payment dialog (#758 / #759)
-    $("new-payment").addEventListener("click", openPaymentDialog);
-    $("dialog-close").addEventListener("click", closePaymentDialog);
-    $("dialog-cancel").addEventListener("click", closePaymentDialog);
-    $("payment-form").addEventListener("submit", submitPayment);
-    $("payment-dialog").addEventListener("click", function (ev) {
-      // Close on backdrop click (click on the <dialog> element itself)
-      if (ev.target === $("payment-dialog")) closePaymentDialog();
+    $("help-close").addEventListener("click", closeHelp);
+    /* The overlay element is its own full-viewport backdrop, so a click that
+       lands on the overlay rather than the panel is a click outside it. There is
+       no separate scrim: a second, lower-z layer would sit permanently behind
+       the overlay and never receive the click. */
+    $("help").addEventListener("click", function (ev) {
+      if (ev.target === $("help")) closeHelp();
     });
+    $("help-open").addEventListener("click", openHelp);
 
+    /* Enter on the highlighted row opens it, so `j`/`k` then Enter is a
+       complete keyboard path through the list. */
     document.addEventListener("keydown", function (ev) {
-      if (ev.key === "Escape") closeDetail();
+      if (ev.key !== "Enter") return;
+      if (store.get().helpOpen) return;
+      if (document.activeElement && document.activeElement.tagName === "TR") {
+        return;
+      }
+      if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+      if (store.get().activeRow < 0) return;
+      ev.preventDefault();
+      openActiveRow();
     });
+
+    document.addEventListener("keydown", onKeydown);
 
     Array.prototype.forEach.call(
       document.querySelectorAll(".chip"),
       function (chip) {
         chip.addEventListener("click", function () {
-          Array.prototype.forEach.call(
-            document.querySelectorAll(".chip"),
-            function (c) {
-              c.className = "chip";
-            }
-          );
-          chip.className = "chip chip-on";
-          state.status = chip.getAttribute("data-status") || "";
-          reload();
+          store.update({ status: chip.getAttribute("data-status") || "" });
+          onFilterChange();
         });
       }
     );
 
-    window.setInterval(function () {
-      if (state.key) pollHealth();
-    }, 30000);
+    /* Back/forward must move the filters, or a shared URL is a lie. */
+    window.addEventListener("hashchange", function () {
+      if (store.get().key) {
+        applyHash();
+        reload();
+      }
+    });
 
-    // Resume an existing session when a key is already stored.
+    window.setInterval(function () {
+      if (store.get().key) pollHealth();
+    }, 30000);
+    window.setInterval(function () {
+      var state = store.get();
+      if (state.key && state.autoRefresh && (!state.status || state.status === "pending")) {
+        reload();
+      }
+    }, 15000);
+
     /* Resume an existing session when a key is already stored. The gate is
        visible until this succeeds, so any failure here simply leaves the user
        looking at the sign-in form rather than at nothing. */
-    var existing = storedKey();
+    var existing = session.read();
     if (existing) {
       signIn(existing, null).catch(function (err) {
         /* A 401 already returned to the gate via signOut() inside api(). Every

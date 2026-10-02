@@ -8,7 +8,7 @@
 //! our check and the actual connect — a DNS-rebinding attack — can't slip a
 //! blocked address past us: the pinned client never re-resolves the host.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
@@ -73,6 +73,9 @@ pub async fn validate(url: &str, allow_private: bool) -> Result<SafeTarget> {
 pub fn pinned_client(target: &SafeTarget, timeout: Duration) -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(timeout)
+        // Redirects must be rejected rather than followed: the destination
+        // of a redirect has not passed the SSRF validation and pinning above.
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!("StellarGate/", env!("CARGO_PKG_VERSION")))
         .resolve(&target.host, target.addr)
         .build()
@@ -113,6 +116,7 @@ fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn blocks_loopback_link_local_and_private_v4() {
@@ -124,7 +128,7 @@ mod tests {
             "192.168.1.1",
         ] {
             assert!(
-                is_blocked_ipv4(ip.parse().unwrap()),
+                is_blocked_ipv4(ip.parse().expect("private IPv4 fixture should parse")),
                 "{ip} should be blocked"
             );
         }
@@ -161,7 +165,7 @@ mod tests {
     fn blocks_loopback_link_local_and_unique_local_v6() {
         for ip in ["::1", "fe80::1", "fc00::1", "fd00::1"] {
             assert!(
-                is_blocked_ipv6(ip.parse().unwrap()),
+                is_blocked_ipv6(ip.parse().expect("private IPv6 fixture should parse")),
                 "{ip} should be blocked"
             );
         }
@@ -197,5 +201,176 @@ mod tests {
         validate("http://127.0.0.1:1234/hook", true)
             .await
             .expect("loopback must be allowed when allow_private is set");
+    }
+
+    // ── #441 new tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn blocks_broadcast_address_explicitly() {
+        // ip.is_broadcast() path: 255.255.255.255
+        assert!(
+            is_blocked_ipv4("255.255.255.255".parse().unwrap()),
+            "broadcast 255.255.255.255 should be blocked"
+        );
+    }
+
+    #[test]
+    fn blocks_documentation_ranges_v4() {
+        // RFC 5737 TEST-NET ranges: 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
+        for ip in ["192.0.2.1", "198.51.100.1", "203.0.113.1"] {
+            assert!(
+                is_blocked_ipv4(ip.parse().unwrap()),
+                "{ip} (documentation range) should be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_multicast_v4() {
+        assert!(
+            is_blocked_ipv4("224.0.0.1".parse().unwrap()),
+            "224.0.0.1 (multicast) should be blocked"
+        );
+        assert!(
+            is_blocked_ipv4("239.255.255.255".parse().unwrap()),
+            "239.255.255.255 (multicast end) should be blocked"
+        );
+    }
+
+    #[test]
+    fn cgnat_boundary_values_v4() {
+        // 100.64.0.0/10 is RFC 6598 shared address space (CGNAT) — should be blocked.
+        assert!(
+            is_blocked_ipv4("100.64.0.1".parse().unwrap()),
+            "100.64.0.1 (CGNAT start) should be blocked"
+        );
+        assert!(
+            is_blocked_ipv4("100.127.255.255".parse().unwrap()),
+            "100.127.255.255 (CGNAT end) should be blocked"
+        );
+        // Just outside the CGNAT range — should be allowed.
+        assert!(
+            !is_blocked_ipv4("100.63.255.255".parse().unwrap()),
+            "100.63.255.255 (just before CGNAT) should be allowed"
+        );
+        assert!(
+            !is_blocked_ipv4("100.128.0.0".parse().unwrap()),
+            "100.128.0.0 (just after CGNAT) should be allowed"
+        );
+    }
+
+    #[test]
+    fn blocks_multicast_v6() {
+        assert!(
+            is_blocked_ipv6("ff02::1".parse().unwrap()),
+            "ff02::1 (IPv6 multicast) should be blocked"
+        );
+        assert!(
+            is_blocked_ipv6("ff00::".parse().unwrap()),
+            "ff00:: (IPv6 multicast start) should be blocked"
+        );
+    }
+
+    #[test]
+    fn blocks_unspecified_v6() {
+        // :: is the IPv6 unspecified address
+        assert!(
+            is_blocked_ipv6("::".parse().unwrap()),
+            ":: (IPv6 unspecified) should be blocked"
+        );
+    }
+
+    #[test]
+    fn is_blocked_ip_dispatches_v4_and_v6_correctly() {
+        // Blocked v4 (loopback)
+        assert!(
+            is_blocked_ip("127.0.0.1".parse().unwrap()),
+            "127.0.0.1 should be blocked via is_blocked_ip"
+        );
+        // Blocked v6 (loopback)
+        assert!(
+            is_blocked_ip("::1".parse().unwrap()),
+            "::1 should be blocked via is_blocked_ip"
+        );
+        // Allowed v4 (public internet)
+        assert!(
+            !is_blocked_ip("8.8.8.8".parse().unwrap()),
+            "8.8.8.8 should be allowed via is_blocked_ip"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_malformed_url() {
+        let err = validate("not a url", false).await.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("invalid url"),
+            "expected 'invalid URL' error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_url_with_no_host() {
+        // The WHATWG parser reads `http:///path` as host `path`, so it is
+        // rejected at resolution rather than by the "no host" guard.
+        let err = validate("http:///path", false).await.unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("no host") || msg.contains("resolve"),
+            "expected a host rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_unresolvable_host() {
+        let err = validate(
+            "http://this-host-definitely-does-not-exist.invalid:80/hook",
+            false,
+        )
+        .await
+        .unwrap_err();
+        // Should fail with either a DNS resolution error or a timeout.
+        assert!(
+            !err.to_string().is_empty(),
+            "expected a resolution failure error, got empty string"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_redirect_to_private_address() {
+        let initial = MockServer::start().await;
+        let private = MockServer::start().await;
+
+        Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(307).insert_header("Location", private.uri()))
+            .mount(&initial)
+            .await;
+        Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&private)
+            .await;
+
+        let initial_url = format!("{}/webhook", initial.uri());
+        let target = validate(&initial_url, true)
+            .await
+            .expect("loopback test target should validate");
+        let client = pinned_client(&target, Duration::from_secs(1))
+            .expect("pinned webhook client should build");
+
+        let response = client
+            .post(initial_url)
+            .send()
+            .await
+            .expect("redirect response should be returned, not followed");
+
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            private
+                .received_requests()
+                .await
+                .expect("private mock request count should be available")
+                .len(),
+            0,
+            "redirect target must not receive a webhook request"
+        );
     }
 }

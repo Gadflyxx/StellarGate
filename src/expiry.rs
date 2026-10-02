@@ -9,8 +9,7 @@
 //! Expiry is purely time- and database-driven, so the sweeper runs even when no
 //! Stellar gateway is configured (unlike the Horizon poller).
 
-use crate::supervise::TaskExit;
-use crate::{db, webhook, AppState};
+use crate::{AppState, db, webhook};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -19,15 +18,13 @@ use tracing::{debug, info, warn};
 /// The webhook event emitted when an intent is swept to `expired`.
 const EXPIRED_EVENT: &str = "payment.expired";
 
-/// Run one sweep: expire up to `expiry_batch_size` overdue pending intents and
-/// fire each one's webhook. Returns how many intents were expired. Safe to call
-/// repeatedly — an intent is transitioned at most once, and a backlog larger
-/// than the batch drains over several sweeps instead of one long write lock.
+/// Run one sweep: expire every overdue pending intent and fire its webhook.
+/// Returns how many intents were expired. Safe to call repeatedly — an intent
+/// is transitioned at most once.
 pub async fn sweep_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
-    let expired = db::expire_overdue(&state.pool, state.config.expiry_batch_size).await?;
+    let expired = db::expire_overdue(&state.pool).await?;
     for payment in &expired {
         info!(payment_id = %payment.id, "payment intent expired");
-        state.payment_metrics.record_expired();
         webhook::dispatch(state, payment, EXPIRED_EVENT, None).await;
     }
     Ok(expired.len())
@@ -35,7 +32,7 @@ pub async fn sweep_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
 
 /// Background loop that sweeps expired intents on the configured poll interval
 /// until the process shuts down.
-pub async fn run_sweeper(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) -> TaskExit {
+pub async fn run_sweeper(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
     let interval = Duration::from_secs(state.config.poll_interval_secs.max(1));
     info!(
         ttl_secs = state.config.payment_ttl_secs,
@@ -48,7 +45,7 @@ pub async fn run_sweeper(state: Arc<AppState>, mut shutdown: watch::Receiver<boo
             _ = tokio::time::sleep(interval) => {}
             _ = shutdown.changed() => {
                 info!("expiry sweeper shutting down");
-                return TaskExit::ShutdownRequested;
+                return;
             }
         }
         match sweep_once(&state).await {
@@ -73,7 +70,7 @@ mod tests {
             port: 0,
             database_url: "sqlite::memory:".into(),
             network: "testnet".into(),
-            horizon_url: "https://horizon.invalid".parse().unwrap(),
+            horizon_url: String::new(),
             gateway_public: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
             accepted_assets: AcceptedAsset::default_list(),
             webhook_secret: "a-very-long-and-secure-webhook-signing-secret-32-chars".into(),
@@ -81,7 +78,6 @@ mod tests {
             webhook_retry_delay_ms: 0,
             webhook_retry_max_delay_ms: 60_000,
             allowed_webhook_schemes: vec!["https".into()],
-            webhook_payload_detail: crate::config::WebhookPayloadDetail::Minimal,
             webhook_timeout_secs: 10,
             webhook_redrive_interval_secs: 30,
             webhook_redrive_concurrency: 4,
@@ -89,14 +85,12 @@ mod tests {
             webhook_redrive_grace_secs: 60,
             webhook_redrive_backoff_initial_secs: 0,
             webhook_redrive_backoff_max_secs: 0,
-            webhook_redrive_jitter_secs: 0,
             retention_interval_secs: 3600,
             webhook_delivery_retention_days: 30,
             idempotency_retention_days: 7,
             poll_interval_secs: 10,
-            cursor_staleness_multiple: 3,
+            poll_max_pages_per_cycle: 50,
             payment_ttl_secs: 3600,
-            expiry_batch_size: 500,
             rate_limit_requests_per_sec: 1000,
             db_pool_max_connections: 5,
             db_busy_timeout_ms: 5000,
@@ -105,20 +99,10 @@ mod tests {
             // Allow loopback targets so tests can dispatch to a wiremock server.
             webhook_allow_private_targets: webhook_url_allowed,
             admin_provisioning_secret: String::new(),
+            metrics_token: String::new(),
             request_timeout_secs: 30,
             stream_idle_timeout_secs: 30,
             trusted_proxy_cidrs: vec![],
-            max_payment_amount: Default::default(),
-            min_payment_amount: Default::default(),
-            max_body_bytes: 256 * 1024,
-            rate_limiter_max_keys: 10_000,
-            rate_limiter_idle_ttl_secs: 60,
-            pagination_default_limit: 20,
-            pagination_max_limit: 100,
-            shutdown_grace_secs: 30,
-            horizon_page_limit: 200,
-            db_prune_batch_size: 500,
-            retention_max_rows_per_cycle: 50_000,
         }
     }
 
@@ -179,7 +163,7 @@ mod tests {
             },
         )
         .await
-        .unwrap();
+        .expect("expired payment fixture should be created");
 
         let expired_count = sweep_once(&state).await.unwrap();
         assert_eq!(expired_count, 1, "the overdue intent must be swept");
@@ -190,7 +174,10 @@ mod tests {
             .unwrap();
         assert_eq!(updated.status, "expired");
 
-        let received = server.received_requests().await.unwrap();
+        let received = server
+            .received_requests()
+            .await
+            .expect("mock server should capture the expiry webhook");
         assert_eq!(received.len(), 1, "exactly one webhook POST must be sent");
         let req = &received[0];
         assert_eq!(
@@ -198,7 +185,8 @@ mod tests {
             EXPIRED_EVENT
         );
 
-        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&req.body).expect("expiry webhook body should be valid JSON");
         assert_eq!(body["event"], EXPIRED_EVENT);
         assert_eq!(body["payment_id"], payment.id);
         assert_eq!(body["status"], "expired");
@@ -207,11 +195,11 @@ mod tests {
         let timestamp: i64 = req
             .headers
             .get("X-StellarGate-Timestamp")
-            .unwrap()
+            .expect("expiry webhook should include a timestamp header")
             .to_str()
-            .unwrap()
+            .expect("expiry webhook timestamp should be ASCII")
             .parse()
-            .unwrap();
+            .expect("expiry webhook timestamp should parse as i64");
         let expected_sig = crate::webhook::sign(&state.config.webhook_secret, timestamp, &req.body);
         assert_eq!(
             req.headers
@@ -224,7 +212,7 @@ mod tests {
 
         let deliveries = db::list_webhook_deliveries(&state.pool, &payment.id)
             .await
-            .unwrap();
+            .expect("expiry webhook delivery should be recorded");
         assert_eq!(deliveries.len(), 1);
         assert_eq!(deliveries[0].status, "delivered");
         assert_eq!(deliveries[0].event(), EXPIRED_EVENT);
